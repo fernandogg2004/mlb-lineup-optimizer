@@ -1,0 +1,268 @@
+# .github/workflows/ci_cd.yml
+# Pipeline CI/CD completo para MLB AI
+#
+# Jobs:
+#   lint-test    → Ruff + pytest (en todos los PRs y pushes a main)
+#   build-push   → Build Docker + push a ECR (solo en push a main)
+#   deploy-ecs   → Rolling deploy en ECS (solo en push a main)
+#   promote-gate → Evalúa si el nuevo modelo supera al champion (solo main)
+#
+# Autenticación AWS: OIDC (sin long-lived credentials en GitHub Secrets)
+# Requisitos en GitHub Secrets:
+#   AWS_ACCOUNT_ID        — ID de cuenta AWS
+#   AWS_REGION            — ej. us-east-1
+#   ECR_REPOSITORY        — ej. mlb-ai-api
+#   ECS_CLUSTER           — ej. mlb-ai-cluster
+#   ECS_SERVICE           — ej. mlb-api-service
+#   ECS_TASK_DEFINITION   — nombre de la task definition
+#   MLB_API_TOKEN_SECRET  — ARN del secreto en Secrets Manager
+#   SLACK_WEBHOOK_URL     — para notificaciones
+
+name: MLB AI — CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "api/**"
+      - "dags/**"
+      - "monitoring/**"
+      - "scripts/**"
+      - "infra/**"
+      - "requirements*.txt"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "api/**"
+      - "dags/**"
+
+# Cancela runs anteriores del mismo PR/branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  AWS_REGION:     ${{ secrets.AWS_REGION }}
+
+permissions:
+  id-token:      write   # OIDC
+  contents:      read
+  pull-requests: write   # para comentarios en PRs
+
+jobs:
+  # ── 1. Lint & Test ──────────────────────────────────────────────────────
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest pytest-cov
+
+      - name: Lint with Ruff
+        run: ruff check src/ api/ dags/ monitoring/ scripts/
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov=api \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junit-xml=test-results.xml \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Pytest Results
+          path: test-results.xml
+          reporter: java-junit
+
+  # ── 2. Build & Push Docker image to ECR ─────────────────────────────────
+  build-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: lint-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image_tag }}
+      image-uri: ${{ steps.push.outputs.image_uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-mlb-ai
+          aws-region:        ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-MBLAI
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata (image tag)
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "image_tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Image tag: $SHORT_SHA"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f infra/Dockerfile \
+            -t ${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }} \
+            -t ${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest \
+            .
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          format:    sarif
+          output:    trivy-results.sarif
+          severity:  CRITICAL,HIGH
+          exit-code: 1    # falla el pipeline si hay CVEs críticos
+
+      - name: Push to ECR
+        id: push
+        run: |
+          IMAGE_URI="${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}"
+          docker push $IMAGE_URI
+          docker push "${{ steps.ecr-login.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Pushed: $IMAGE_URI"
+
+  # ── 3. Deploy to ECS (rolling update) ───────────────────────────────────
+  deploy-ecs:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: build-push
+    environment: production    # requiere aprobación manual en GitHub Environments
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:    arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-mlb-ai
+          aws-region:        ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-MBLAI-Deploy
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update container image in task definition
+        id: update-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition:  task-def.json
+          container-name:   mlb-api
+          image:            ${{ needs.build-push.outputs.image-uri }}
+
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:       ${{ steps.update-task-def.outputs.task-definition }}
+          service:               ${{ secrets.ECS_SERVICE }}
+          cluster:               ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes:      10
+
+      - name: Verify deployment (healthcheck)
+        run: |
+          sleep 30
+          STATUS=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --query "services[0].deployments[0].rolloutState" \
+            --output text)
+          echo "Deployment status: $STATUS"
+          if [ "$STATUS" != "COMPLETED" ]; then
+            echo "Deployment failed with status: $STATUS"
+            exit 1
+          fi
+
+      - name: Notify Slack — Deploy OK
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": ":rocket: *MLB AI Deploy completado*\n>Commit: `${{ github.sha }}`\n>Branch: `${{ github.ref_name }}`\n>Image: `${{ needs.build-push.outputs.image-tag }}`"
+            }'
+
+      - name: Notify Slack — Deploy FAILED
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": ":rotating_light: *MLB AI Deploy FALLIDO*\n>Commit: `${{ github.sha }}`\n>Ver: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+
+  # ── 4. Model Promotion Gate (opcional, post-deploy) ──────────────────────
+  model-promote-gate:
+    name: Evaluate Model Promotion
+    runs-on: ubuntu-latest
+    needs: deploy-ecs
+    if: github.ref == 'refs/heads/main'
+    continue-on-error: true   # no bloquea el pipeline si el challenger no supera
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-mlb-ai
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Run model promotion evaluation (dry-run)
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          SLACK_WEBHOOK_URL:   ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python scripts/promote_model.py \
+            --challenger-version $(cat models/.version 2>/dev/null || echo 1) \
+            --holdout-season 2024 \
+            --features-path data/gold/features_train_v2.parquet \
+            --dry-run

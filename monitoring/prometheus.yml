@@ -1,0 +1,49 @@
+# prometheus.yml — Configuración de scraping para el stack MLB AI
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+    project:     mlb-ai
+
+# Reglas de alertas
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+# Alertmanager (configura el endpoint real)
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # ── FastAPI inference API ─────────────────────────────────────────────────
+  - job_name: mlb_api
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # ── MLflow server ─────────────────────────────────────────────────────────
+  - job_name: mlflow
+    static_configs:
+      - targets: ["mlflow:5000"]
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # ── PostgreSQL exporter ───────────────────────────────────────────────────
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+    scrape_interval: 30s
+
+  # ── Node/host metrics ─────────────────────────────────────────────────────
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+    scrape_interval: 30s
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

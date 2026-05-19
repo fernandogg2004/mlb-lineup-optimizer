@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Copy-Item *)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(ls \"C:\\\\Users\\\\ferna\\\\Desktop\\\\MLB AI\\\\models\\\\\")",
+      "Bash(.venv/Scripts/python.exe -m src.models.model_at_bat train --features-path data/gold/features_train.parquet --val-seasons 2024 --output-dir models/ --experiment pa-model-v2-no-leakers)"
+    ]
+  }
+}

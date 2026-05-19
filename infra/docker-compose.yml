@@ -1,0 +1,189 @@
+# =============================================================================
+# docker-compose.yml — Stack completo MLB AI (desarrollo / staging local)
+#
+# Servicios:
+#   api       → FastAPI inference server
+#   postgres  → Base de datos de predicciones y shadow results
+#   mlflow    → Model registry + experiment tracking
+#   prometheus → Scraping de métricas
+#   grafana   → Dashboards de observabilidad
+#   nginx     → Reverse proxy con SSL termination
+#
+# Uso:
+#   docker compose up -d
+#   docker compose logs -f api
+#
+# Variables de entorno requeridas en .env (NO commitear):
+#   MLB_API_TOKEN, POSTGRES_PASSWORD, MLFLOW_S3_BUCKET, AWS_ACCESS_KEY_ID, etc.
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  mlb_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:
+  model_data:      # montado en api para los pkl
+  silver_data:     # montado en api para los parquets
+
+# ---------------------------------------------------------------------------
+services:
+# ---------------------------------------------------------------------------
+
+  # ── API de inferencia ────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    image: mlb-ai-api:${IMAGE_TAG:-latest}
+    container_name: mlb_api
+    restart: unless-stopped
+    environment:
+      MLB_API_TOKEN:       ${MLB_API_TOKEN}
+      MODEL_PATH:          /app/models/at_bat_predictor.pkl
+      SHADOW_MODEL_PATH:   ${SHADOW_MODEL_PATH:-}
+      SILVER_DIR:          /app/data/silver/plate_appearances
+      DATABASE_URL:        postgresql://mlb:${POSTGRES_PASSWORD}@postgres:5432/mlb_predictions
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      LOG_LEVEL:           ${LOG_LEVEL:-INFO}
+      MAX_WORKERS:         ${MAX_WORKERS:-4}
+      # Credenciales AWS (en producción usar IAM roles, no env vars)
+      AWS_DEFAULT_REGION:  ${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      - model_data:/app/models:ro          # read-only: no escribe modelos
+      - silver_data:/app/data/silver:ro    # read-only: no modifica Silver
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 60s
+    networks:
+      - mlb_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: mlb_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       mlb_predictions
+      POSTGRES_USER:     mlb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlb -d mlb_predictions"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    networks:
+      - mlb_net
+
+  # ── MLflow tracking server ───────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    container_name: mlb_mlflow
+    restart: unless-stopped
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri postgresql://mlb:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+        --default-artifact-root s3://${MLFLOW_S3_BUCKET:-mlb-ai-datalake}/mlflow-artifacts
+        --serve-artifacts
+    environment:
+      AWS_DEFAULT_REGION:    ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 30s
+    networks:
+      - mlb_net
+
+  # ── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: mlb_prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - mlb_net
+
+  # ── Grafana ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: mlb_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD:  ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_USER:      admin
+      GF_USERS_ALLOW_SIGN_UP:      "false"
+      GF_SERVER_ROOT_URL:          "%(protocol)s://%(domain)s/grafana"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - mlb_net
+
+  # ── Nginx reverse proxy ──────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.26-alpine
+    container_name: mlb_nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro      # certificados TLS
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - api
+      - grafana
+    networks:
+      - mlb_net

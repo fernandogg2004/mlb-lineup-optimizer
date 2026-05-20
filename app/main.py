@@ -1270,6 +1270,162 @@ def _players_bulk(player_ids: list[int]) -> dict[int, dict]:
     return out
 
 
+def _approx_prob_vector(avg: float, obp: float, slg: float) -> list[float]:
+    """7-class PA outcome prob vector from career slash line (ported from DAG)."""
+    pa_adj = 0.97
+    p_bb  = max(round((obp - avg) * pa_adj, 4), 0.04)
+    p_hr  = max(round((slg - avg) / 4.2, 4), 0.01)
+    p_3b  = 0.005
+    p_2b  = max(round((slg - avg - p_hr * 3 - p_3b * 2) * 0.35, 4), 0.02)
+    p_1b  = max(round(avg - p_hr - p_3b - p_2b, 4), 0.08)
+    p_k   = max(round(0.22 - (obp - 0.310) * 0.6, 4), 0.08)
+    p_out = max(round(1.0 - p_bb - p_hr - p_3b - p_2b - p_1b - p_k, 4), 0.20)
+    raw   = [p_out, p_k, p_bb, p_1b, p_2b, p_3b, p_hr]
+    total = sum(raw)
+    return [round(x / total, 4) for x in raw]
+
+
+def _on_demand_optimize(game_pk: int) -> dict:
+    """Fast on-demand optimization when Airflow hasn't written to DB yet."""
+    from app.schemas import LineupOptimizeRequest, PlayerRosterEntry, RivalPitcherRequest
+
+    # 1. Fetch game from MLB API
+    data = _stats_get("/schedule", params={
+        "sportId": 1, "gamePk": game_pk,
+        "hydrate": "team,probablePitcher,status",
+    })
+    game_info: dict | None = None
+    for de in data.get("dates", []):
+        for g in de.get("games", []):
+            if g.get("gamePk") == game_pk:
+                game_info = g
+                break
+
+    if not game_info:
+        raise HTTPException(status_code=404, detail=f"game_pk={game_pk} not found in MLB schedule")
+
+    home         = game_info["teams"]["home"]
+    away         = game_info["teams"]["away"]
+    home_team_id = home["team"]["id"]
+    home_name    = home["team"]["name"]
+    away_name    = away["team"]["name"]
+    away_pp      = away.get("probablePitcher", {})
+    away_pid     = away_pp.get("id")
+
+    # 2. Build projected batting order from 40-Man roster
+    pos_priority = {"DH": 0, "RF": 1, "LF": 2, "CF": 3,
+                    "1B": 4, "3B": 5, "SS": 6, "2B": 7, "C": 8}
+    roster_raw = _stats_get(
+        f"/teams/{home_team_id}/roster/40Man",
+        params={"hydrate": "person(stats(type=career,group=hitting))"},
+    ).get("roster", [])
+
+    batters: list[dict] = []
+    for entry in roster_raw:
+        pos = entry.get("position", {}).get("abbreviation", "")
+        if pos in ("SP", "RP", "P"):
+            continue
+        person = entry.get("person", {})
+        pid = person.get("id")
+        if not pid:
+            continue
+        avg, obp, slg = 0.248, 0.318, 0.398
+        for s in person.get("stats", []):
+            if s.get("type", {}).get("displayName") == "career":
+                sp = (s.get("splits") or [{}])[0].get("stat", {})
+                avg = float(sp.get("avg", avg) or avg)
+                obp = float(sp.get("obp", obp) or obp)
+                slg = float(sp.get("slg", slg) or slg)
+                break
+        iso  = round(max(slg - avg, 0.0), 3)
+        woba = round((obp * 1.2 + slg * 0.7) / 2, 3)
+        batters.append({
+            "player_id":   int(pid),
+            "player_name": person.get("fullName", f"Player {pid}"),
+            "batter_stand": person.get("batSide", {}).get("code", "R"),
+            "obp": round(obp, 3), "woba": woba, "iso": iso,
+            "prob_vector": _approx_prob_vector(avg, obp, slg),
+            "_priority": pos_priority.get(pos, 9),
+        })
+    batters.sort(key=lambda x: x["_priority"])
+
+    if len(batters) < 9:
+        raise HTTPException(status_code=503, detail="Insufficient roster data for on-demand optimization")
+
+    roster_entries = [{k: v for k, v in b.items() if not k.startswith("_")}
+                      for b in batters[:9]]
+
+    # 3. Pitcher info
+    pitcher_name = away_pp.get("fullName", f"Pitcher {away_pid}")
+    pitcher_hand, pitcher_era = "R", 4.00
+    if away_pid:
+        try:
+            pdata = _stats_get(f"/people/{away_pid}",
+                               params={"hydrate": "stats(group=[pitching],type=[season])"})
+            pp = (pdata.get("people") or [{}])[0]
+            pitcher_name = pp.get("fullName", pitcher_name)
+            pitcher_hand = pp.get("pitchHand", {}).get("code", "R")
+            for s in pp.get("stats", []):
+                if s.get("type", {}).get("displayName") == "season":
+                    era_str = (s.get("splits") or [{}])[0].get("stat", {}).get("era", "4.00")
+                    try:
+                        pitcher_era = float(era_str)
+                    except (ValueError, TypeError):
+                        pass
+                    break
+        except Exception:
+            pass
+
+    # 4. Optimize (fast mode — 5k sims)
+    req = LineupOptimizeRequest(
+        roster=[PlayerRosterEntry(**p) for p in roster_entries],
+        rival_pitcher=RivalPitcherRequest(
+            pitcher_id=int(away_pid) if away_pid else 0,
+            pitcher_name=pitcher_name,
+            hand=pitcher_hand,
+            era=pitcher_era,
+            pitch_mix={"FF": 0.55, "SL": 0.20, "CH": 0.15, "CB": 0.10},
+        ),
+        fast_mode=True,
+        apply_feedback_overrides=False,
+    )
+    result = _run_optimization_sync(req)
+
+    # 5. Enrich lineup with display stats from bulk lookup
+    ordered_ids  = [p["player_id"] for p in roster_entries]
+    bench_ids    = [b["player_id"] for b in batters[9:12]]
+    pinfo        = _players_bulk(ordered_ids + bench_ids)
+    _def         = lambda pid: {"player_id": pid, "name": f"Player {pid}", "pos": "—",
+                                "hand": "R", "avg": .248, "ops": .716,
+                                "woba": .315, "obp": .318, "iso": .150}
+    lineup = [{"order": i, **{k: v for k, v in pinfo.get(pid, _def(pid)).items()
+                              if k != "pitch_hand"}}
+              for i, pid in enumerate(ordered_ids, 1)]
+    bench  = [{k: v for k, v in pinfo.get(pid, _def(pid)).items() if k != "pitch_hand"}
+              for pid in bench_ids if pid]
+
+    return {
+        "game_pk":           game_pk,
+        "expected_runs":     round(result.expected_runs, 3),
+        "win_probability":   round(result.win_probability, 4),
+        "model_confidence":  0.65,
+        "optimization_mode": "on_demand_fast",
+        "model_version":     _state.model_version,
+        "total_simulations": 5_000,
+        "elapsed_seconds":   round(result.elapsed_seconds, 1),
+        "lineup":            lineup,
+        "bench":             bench,
+        "rag_explanation": (
+            f"## Lineup Óptimo — {away_name} @ {home_name}\n\n"
+            f"**Predicción on-demand** (fast mode, 5k sims). "
+            f"La predicción definitiva llega via Airflow a T-2h.\n\n"
+            f"E[R] proyectado: **{result.expected_runs:.2f}** · "
+            f"P(Victoria): **{result.win_probability:.1%}**\n\n"
+            f"Lanzador rival: **{pitcher_name}** ({pitcher_hand}HP) · ERA {pitcher_era:.2f}"
+        ),
+    }
+
+
 @app.get("/v1/games/today", tags=["dashboard"])
 async def games_today() -> dict:
     """Partidos MLB programados para hoy con probable pitchers."""
@@ -1358,7 +1514,9 @@ async def get_optimize(game_pk: int) -> dict:
         raise HTTPException(status_code=503, detail=f"DB error: {exc}")
 
     if not row:
-        raise HTTPException(status_code=404, detail=f"Sin predicción para game_pk={game_pk}")
+        # Airflow hasn't written a prediction yet — run fast on-demand optimization
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _on_demand_optimize, game_pk)
 
     (ai_lineup, ai_er, win_prob, opt_mode, model_ver, predicted_at,
      home_order, home_name, away_name, lineup_source) = row

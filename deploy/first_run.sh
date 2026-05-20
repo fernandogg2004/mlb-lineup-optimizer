@@ -27,6 +27,12 @@ step() { echo -e "\n${YELLOW}=== $* ===${NC}"; }
 COMPOSE="docker compose -f docker-compose.vps.yml --env-file .env"
 
 # ---------------------------------------------------------------------------
+step "[0/6] Preparando directorios con permisos correctos"
+mkdir -p logs reports/gameday
+chown -R 50000:0 logs reports
+log "Directorios listos."
+
+# ---------------------------------------------------------------------------
 step "[1/6] Construyendo imágenes y arrancando contenedores"
 $COMPOSE up -d --build
 log "Contenedores arrancados. Esperando que estén healthy..."

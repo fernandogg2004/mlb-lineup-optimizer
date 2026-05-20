@@ -28,7 +28,7 @@ from __future__ import annotations
 import io
 import os
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
@@ -389,7 +389,6 @@ def _send_via_ses(
             "SES_FROM_EMAIL and SES_TO_EMAILS must be set to send the report."
         )
 
-    import base64
     import email.mime.application
     import email.mime.multipart
     import email.mime.text

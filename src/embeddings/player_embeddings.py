@@ -64,8 +64,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -883,7 +881,6 @@ def main(argv: list[str] | None = None) -> None:
         encoder.eval()
 
         # Re-use EmbeddingTrainer.extract_all_embeddings via a minimal wrapper
-        device_str = "cuda" if torch.cuda.is_available() else "cpu"
         config = TrainingConfig(latent_dim=16)  # latent_dim inferred from model
         model = PitcherAutoencoder(latent_dim=config.latent_dim)
         trainer = EmbeddingTrainer(model, dataset, config)

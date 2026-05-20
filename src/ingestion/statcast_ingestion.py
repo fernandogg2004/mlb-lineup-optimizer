@@ -37,12 +37,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import logging
 import os
 import time
 import uuid
-from datetime import date, datetime, timedelta
-from typing import Iterator, Optional
+from datetime import date, datetime
+from typing import Optional
 
 import boto3
 import httpx
@@ -51,7 +50,7 @@ from botocore.exceptions import ClientError
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, TimestampType
+from pyspark.sql.types import StringType
 from tenacity import (
     retry,
     retry_if_exception_type,

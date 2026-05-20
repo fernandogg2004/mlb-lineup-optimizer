@@ -53,7 +53,7 @@ from __future__ import annotations
 import argparse
 import pickle
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Optional
@@ -64,7 +64,6 @@ import mlflow.lightgbm
 import numpy as np
 import polars as pl
 import structlog
-from scipy.stats import chi2_contingency
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import log_loss
 from sklearn.model_selection import TimeSeriesSplit

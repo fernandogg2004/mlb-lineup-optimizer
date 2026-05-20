@@ -59,16 +59,13 @@ Notas de producción:
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
 import pendulum
-import psycopg2
-import psycopg2.extras
 import pytz
 import requests
 import structlog
@@ -169,7 +166,7 @@ def _http_post_json(url: str, payload: dict, headers: dict | None = None) -> dic
             if attempt == _HTTP_RETRIES:
                 raise
             time.sleep(_HTTP_BACKOFF ** attempt)
-        except requests.exceptions.RequestException as exc:
+        except requests.exceptions.RequestException:
             if attempt == _HTTP_RETRIES:
                 raise
             time.sleep(_HTTP_BACKOFF ** attempt)

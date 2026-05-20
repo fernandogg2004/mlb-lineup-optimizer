@@ -22,9 +22,9 @@ from __future__ import annotations
 import os
 import tempfile
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Generator
 
 import mlflow
 import structlog

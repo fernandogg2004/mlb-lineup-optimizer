@@ -20,20 +20,18 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-import numpy as np
 import polars as pl
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from starlette.responses import Response
 
 from api.metrics import (
     INFERENCE_ERRORS,
     INFERENCE_LATENCY,
-    PREDICTIONS_DIST,
     REQUEST_COUNTER,
     record_prediction_distribution,
 )
@@ -232,7 +230,7 @@ async def predict_game(
 
     try:
         resp = _req.get(
-            f"https://statsapi.mlb.com/api/v1/schedule",
+            "https://statsapi.mlb.com/api/v1/schedule",
             params={"sportId": 1, "gamePk": game_pk, "hydrate": "lineups,team,probablePitcher"},
             timeout=10,
         )
@@ -276,7 +274,6 @@ async def predict_all(
     _token: str = Depends(verify_token),
 ) -> AllGamesResponse:
     """Predicción para todos los partidos de una fecha. Usado por el DAG de Airflow."""
-    import requests as _req
     from predict_tonight import fetch_games, _predict_one_side
 
     try:

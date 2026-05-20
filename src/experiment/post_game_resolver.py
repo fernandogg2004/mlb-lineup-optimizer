@@ -457,7 +457,8 @@ def resolve_pending_outcomes(
 
 def main() -> None:
     """Run the resolver once for the given date (or today)."""
-    import argparse, json
+    import argparse
+    import json
 
     parser = argparse.ArgumentParser(description="MLB post-game A/B experiment resolver")
     parser.add_argument("--date", default=None, help="Target date YYYY-MM-DD (default: today)")

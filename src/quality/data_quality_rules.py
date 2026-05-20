@@ -49,16 +49,12 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import structlog
 from great_expectations.core import ExpectationSuite
 from great_expectations.core.batch import RuntimeBatchRequest
 from great_expectations.data_context import FileDataContext
-from great_expectations.data_context.types.base import (
-    DataContextConfig,
-    FilesystemStoreBackendDefaults,
-)
 from great_expectations.exceptions import DataContextError
 
 # ---------------------------------------------------------------------------
@@ -230,17 +226,7 @@ def build_plate_appearances_suite(context: FileDataContext) -> ExpectationSuite:
         Saved ``ExpectationSuite`` instance.
     """
     suite = context.add_or_update_expectation_suite(expectation_suite_name=SUITE_NAME)
-    validator = context.get_validator(
-        batch_request=RuntimeBatchRequest(
-            datasource_name=DATASOURCE_NAME,
-            data_connector_name="runtime_data_connector",
-            data_asset_name=DATA_ASSET_NAME,
-            runtime_parameters={"batch_data": None},  # populated at validation time
-            batch_identifiers={"game_date": "schema_build", "run_id": "build"},
-        ),
-        expectation_suite_name=SUITE_NAME,
-        catch_exceptions=False,
-    ) if False else None  # validator used only when running against real data
+    # validator = context.get_validator(...) — only needed when running against real data
 
     # We build expectations programmatically on the suite object directly
     # (not via validator) so this function can run without a live Spark session.

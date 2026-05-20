@@ -12,10 +12,8 @@ Schedule: 12:00 UTC (8am ET) — tiempo suficiente antes de los primeros pitches
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timedelta
-from pathlib import PurePosixPath
+from datetime import timedelta
 
 import boto3
 import pendulum
@@ -23,7 +21,6 @@ import requests
 from airflow.decorators import dag, task
 from airflow.models import Variable
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.amazon.aws.operators.ecs import EcsRunTaskOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.utils.trigger_rule import TriggerRule
 
@@ -278,7 +275,6 @@ def mlb_daily_pipeline():
     @task(task_id="store_results")
     def store_results(inference_results: dict, data_interval_start=None) -> None:
         import json as _json
-        from datetime import date
 
         run_date: str = data_interval_start.strftime("%Y-%m-%d")
         pg = PostgresHook(postgres_conn_id=POSTGRES_CONN)

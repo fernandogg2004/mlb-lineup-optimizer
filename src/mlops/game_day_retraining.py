@@ -39,7 +39,6 @@ from typing import Any, Optional
 import numpy as np
 import polars as pl
 import structlog
-from sklearn.metrics import log_loss
 
 from src.mlops.mlflow_registry import (
     MLflowRegistry,

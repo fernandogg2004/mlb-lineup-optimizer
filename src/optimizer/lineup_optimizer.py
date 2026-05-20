@@ -56,13 +56,13 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import mlflow
 import numpy as np
 import structlog
-from deap import algorithms, base, creator, tools
+from deap import base, creator, tools
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -386,7 +386,7 @@ class OptimizerResult:
     def display(self) -> str:
         """Returns a formatted lineup display string for the coaching staff UI."""
         lines = [
-            f"=== OPTIMAL LINEUP ===",
+            "=== OPTIMAL LINEUP ===",
             f"E[R] = {self.best_expected_runs:.3f}  P(W) = {self.best_win_probability:.3f}",
             f"Time: {self.total_elapsed_seconds:.1f}s | Evaluations: {self.n_fitness_evaluations:,}",
             "",
@@ -761,7 +761,7 @@ class GeneticLineupOptimizer:
         t_start = time.perf_counter()
 
         mlflow.set_experiment(cfg.mlflow_experiment)
-        with mlflow.start_run(run_name=f"ga-optimizer-{time.strftime('%Y%m%d-%H%M%S')}") as run:
+        with mlflow.start_run(run_name=f"ga-optimizer-{time.strftime('%Y%m%d-%H%M%S')}"):  # noqa: SIM117
             mlflow.log_params({
                 "population_size":    cfg.population_size,
                 "n_generations":      cfg.n_generations,

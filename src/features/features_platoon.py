@@ -52,7 +52,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -611,7 +610,6 @@ class PlatoonSplitsEngine:
         pa_arr = merged["pa"].to_numpy()
 
         stabilized_cols: dict[str, np.ndarray] = {}
-        ci_cols: dict[str, np.ndarray] = {}
 
         metric_configs = [
             ("woba",    self._shrink_woba,  "woba_raw",    "woba_prior"),

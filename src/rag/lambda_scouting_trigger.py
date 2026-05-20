@@ -40,7 +40,6 @@ from src.rag.scouting_rag_ingest import (
     IngestionConfig,
     ScoutReport,
     ScoutingIngestionPipeline,
-    ScoutType,
 )
 
 logger = structlog.get_logger(__name__)

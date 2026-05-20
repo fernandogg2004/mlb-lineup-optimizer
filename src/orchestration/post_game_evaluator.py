@@ -19,13 +19,10 @@ Zona horaria:
 """
 from __future__ import annotations
 
-import logging
 import math
-import os
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from io import BytesIO
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -191,7 +188,7 @@ class PostGameEvaluator:
         logger.info("post_game_evaluator_start", game_date=game_date, n_games=len(game_pks))
 
         # 1. Esperar a que todos los partidos finalicen
-        final_statuses = self.wait_for_all_games_final(game_pks, game_date)
+        self.wait_for_all_games_final(game_pks, game_date)
 
         # 2. Cargar predicciones pre-partido desde la BD
         predictions = self.load_predictions_from_db(game_pks)
@@ -556,7 +553,7 @@ class PostGameEvaluator:
         # --- Portada / encabezado ---
         now_et = datetime.now(_ET_TZ)
         story.append(Paragraph(
-            f"MLB AI — Informe de Rendimiento del Modelo",
+            "MLB AI — Informe de Rendimiento del Modelo",
             title_style,
         ))
         story.append(Paragraph(

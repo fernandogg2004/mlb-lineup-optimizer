@@ -23,7 +23,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
 
 import structlog
 from datasets import Dataset
@@ -388,11 +387,6 @@ class RAGEvaluator:
         only returns the score dict for the caller to decide.
         """
         sample = EvaluationSample(question=question, answer=answer, contexts=contexts)
-        config_no_raise = RAGEvalConfig(
-            faithfulness_threshold=self._config.faithfulness_threshold,
-            answer_relevance_threshold=self._config.answer_relevance_threshold,
-            raise_on_faithfulness_failure=False,
-        )
         # Temporarily disable raise to get the report
         original_raise = self._config.raise_on_faithfulness_failure
         self._config.raise_on_faithfulness_failure = False

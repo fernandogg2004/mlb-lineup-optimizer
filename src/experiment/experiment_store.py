@@ -459,7 +459,6 @@ def _build_interpretation_es(
     if manager_advantage is None or avg_ai is None or avg_actual is None:
         return "Datos incompletos — registra resultados con POST /v1/experiment/record-outcome."
 
-    direction = "por encima" if manager_advantage >= 0 else "por debajo"
     abs_adv = abs(manager_advantage)
     season_proj = round(abs_adv * 162, 1)
 

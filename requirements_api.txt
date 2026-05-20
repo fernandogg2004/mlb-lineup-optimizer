@@ -51,3 +51,9 @@ tiktoken==0.13.0
 
 # --- Scheduling (local retraining trigger) ---
 apscheduler==3.10.4
+
+# --- HTTP client (MLB Stats API calls in dashboard endpoints) ---
+requests==2.32.3
+
+# --- PostgreSQL (dashboard read endpoints) ---
+psycopg2-binary==2.9.9

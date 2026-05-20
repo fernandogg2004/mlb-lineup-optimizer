@@ -1,0 +1,53 @@
+# =============================================================================
+# MLB Lineup Optimizer — API Runtime Dependencies
+# Only packages required by app/main.py and its src/ imports.
+# No Spark, Airflow, dbt, or data-engineering tooling.
+# =============================================================================
+
+# --- HTTP API framework ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+gunicorn==22.0.0
+python-multipart==0.0.9
+
+# --- Observability ---
+prometheus-client==0.25.0
+structlog==24.1.0
+python-json-logger==2.0.7
+
+# --- Schema / validation ---
+pydantic==2.13.4
+
+# --- Configuration ---
+python-dotenv==1.0.1
+pyyaml==6.0.3
+
+# --- ML inference ---
+numpy==1.26.4
+lightgbm==4.3.0
+numba==0.59.1
+scikit-learn==1.8.0
+scipy==1.17.1
+
+# --- Data transforms ---
+polars==0.20.31
+
+# --- Genetic optimizer ---
+deap==1.4.1
+
+# --- Monte Carlo simulation (Ray for parallel workers) ---
+ray==2.20.0
+
+# --- Model registry ---
+mlflow==2.13.2
+boto3==1.43.10
+botocore==1.43.10
+
+# --- RAG / LLM (lazy-loaded, only when crisis_triggered=True) ---
+anthropic==0.103.0
+llama-index-core==0.14.22
+llama-index-llms-anthropic==0.11.4
+tiktoken==0.13.0
+
+# --- Scheduling (local retraining trigger) ---
+apscheduler==3.10.4

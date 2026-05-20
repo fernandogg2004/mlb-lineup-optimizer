@@ -49,22 +49,13 @@ WORKDIR /build
 
 # Copy only requirement files first so Docker layer caching avoids
 # re-installing packages when only application code changes.
-COPY requirements.txt \
-     requirements_phase_2.txt \
-     requirements_phase_3.txt \
-     requirements_phase_4.txt \
-     requirements_phase_5.txt \
-     ./
+COPY requirements_api.txt ./
 
 # Install all packages into /install (--prefix) so we can copy cleanly
 # into the runtime stage without build tools.
 RUN pip install --no-cache-dir --upgrade pip==24.1.2 && \
     pip install --no-cache-dir --prefix=/install \
-        -r requirements.txt \
-        -r requirements_phase_2.txt \
-        -r requirements_phase_3.txt \
-        -r requirements_phase_4.txt \
-        -r requirements_phase_5.txt
+        -r requirements_api.txt
 
 
 # ---- Stage 2: runtime image ---------------------------------------------
@@ -95,8 +86,10 @@ COPY src/  ./src/
 COPY app/  ./app/
 
 # Prometheus multi-process directory (shared across uvicorn workers)
-RUN mkdir -p /tmp/prometheus_multiproc && \
-    chown mlb:mlb /tmp/prometheus_multiproc
+# Numba JIT cache directory (needs write access; source files are read-only)
+# Matplotlib config directory (avoids permission warnings)
+RUN mkdir -p /tmp/prometheus_multiproc /tmp/numba_cache /tmp/matplotlib && \
+    chown -R mlb:mlb /tmp/prometheus_multiproc /tmp/numba_cache /tmp/matplotlib
 
 # Model artifacts directory (mounted as read-only volume in production)
 RUN mkdir -p /models && chown mlb:mlb /models
@@ -105,6 +98,8 @@ ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc \
+    NUMBA_CACHE_DIR=/tmp/numba_cache \
+    MPLCONFIGDIR=/tmp/matplotlib \
     PORT=8000
 
 # Kubernetes liveness probe: lightweight TCP check

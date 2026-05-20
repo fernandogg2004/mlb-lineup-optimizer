@@ -756,8 +756,21 @@ class AtBatPredictor:
         """
         if not Path(path).exists():
             raise FileNotFoundError(f"Model file not found: {path}")
+
+        # Custom unpickler: remaps __main__.ClassName → this module so pickles
+        # created from a training script (where classes lived in __main__) can
+        # be loaded safely inside gunicorn/uvicorn workers.
+        import sys
+        _this_module = sys.modules[__name__]
+
+        class _SafeUnpickler(pickle.Unpickler):
+            def find_class(self, module, name):
+                if module == "__main__" and hasattr(_this_module, name):
+                    return getattr(_this_module, name)
+                return super().find_class(module, name)
+
         with open(path, "rb") as f:
-            payload = pickle.load(f)
+            payload = _SafeUnpickler(f).load()
         predictor = cls(config=payload["config"])
         predictor._calibrated_model = payload["calibrated_model"]
         predictor._base_model       = payload["base_model"]

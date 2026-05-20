@@ -5,32 +5,33 @@ Game-Day Orchestrator — Motor de operaciones en tiempo real del MLB Lineup Opt
 
 Programación: 08:00 UTC diario (10:00 Madrid / 04:00 EDT).
 
-Flujo de 3 tareas con Dynamic Task Mapping:
+Flujo de 5 tareas con Dynamic Task Mapping:
 
     Task 1 — fetch_todays_schedule
         Consulta la MLB StatsAPI y devuelve la lista de partidos del día.
         Output: list[dict] — una entrada por gamePk.
 
-    Task 2 — game_pipeline_dynamic_map (×N instancias, una por partido)
-        Por cada partido en paralelo:
-            2a. Espera la ventana T-2h antes del primer pitch.
-            2b. LineupSensor: consulta el live-feed de la MLB hasta que el lineup
-                oficial esté disponible.  Si no llega → falla con retries=4 / 30min.
-                Si el partido ya empezó sin lineup oficial → usa roster proyectado
-                (fallback) para no bloquear el pipeline.
-            2c. Pre-game Inference: construye el request de optimización con las
-                stats de los bateadores confirmados, llama a /v1/optimize/lineup y
-                guarda la predicción en PostgreSQL (tabla gameday_predictions).
+    Task P — preliminary_optimization (×N, una por partido)
+        Corre INMEDIATAMENTE después de Task 1. No espera el lineup oficial.
+        Usa probable pitcher + roster proyectado (40-Man). fast_mode=True.
+        Escribe gameday_predictions con lineup_source="preliminary".
+        Streamlit puede mostrar predicciones desde las 10:00 AM sin esperar T-2h.
+
+    Task 2a — wait_pregame_window (×N sensor, mode="reschedule")
+        Sensor por partido que libera el worker slot mientras espera la ventana T-2h.
+        Poke interval: 60 s. Timeout: 15 horas (partidos de Costa Oeste).
+
+    Task 2b — lineup_sense_and_optimize (×N, una por partido)
+        Corre tras wait_pregame_window[i] — NO antes.
+        Llama al LineupSensor y, cuando el lineup oficial está disponible,
+        invoca POST /v1/optimize/lineup con fast_mode=False (100k sims definitivas).
+        UPSERT sobre la fila "preliminary" ya existente en gameday_predictions.
+        Persiste confidence_score, confidence_level, scorecard_json, defense_report_md.
 
     Task 3 — await_and_resolve_all_games (trigger_rule=ALL_DONE)
-        Corre cuando TODAS las Task 2 han terminado (éxito o fallo).
-        Llama a PostGameEvaluator.run():
-            - Espera polling hasta que todos los partidos alcancen estado Final.
-            - Descarga boxscores reales.
-            - Calcula delta E[R], MAE, RMSE.
-            - Genera informe PDF con reportlab.
-            - Guarda resoluciones en PostgreSQL.
-            - Envía resumen a Slack.
+        Corre cuando TODAS las Task 2b han terminado (éxito o fallo).
+        PostGameEvaluator: espera estado Final → boxscores → delta E[R] → PDF → Slack.
+        Al terminar, dispara TriggerDagRunOperator → mlb_nightly_training.
 
 Zonas horarias:
     - Toda la lógica interna usa UTC (pytz.UTC).
@@ -38,27 +39,15 @@ Zonas horarias:
     - Conversiones a ET solo para logging y presentación.
 
 Manejo de errores:
-    - Cada llamada HTTP tiene reintentos exponenciales (_http_get_json).
-    - El LineupSensor falla intencionalmente (raises AirflowException) para
-      activar los reintentos de Airflow (retries=4, retry_delay=30min).
-    - Si el partido ya inició (abstractGameState == "Live") y el lineup sigue
-      vacío, se usa el roster 40-Man proyectado con stats de carrera como fallback.
-    - Task 3 usa trigger_rule=ALL_DONE para ejecutarse incluso si alguna Task 2 falló.
-
-Notas de producción:
-    - El bloque de espera en Task 2 usa time.sleep() en chunks de 60 segundos.
-      En producción con muchos partidos simultáneos, reemplazar el bloque de espera
-      por un DateTimeSensor(mode="reschedule") para liberar el worker slot durante
-      la espera larga. Ejemplo al final del archivo.
-    - La llamada a la FastAPI usa la URL de Airflow Variable MLB_API_INFERENCE_URL.
-      En entornos con ECS/K8s, usar el endpoint interno del servicio.
-    - Las credenciales PostgreSQL se leen de la Airflow Connection "mlb_predictions_db".
-    - La tabla gameday_predictions debe existir antes de ejecutar el DAG.
-      DDL disponible en el docstring de _ensure_predictions_table().
+    - Task P: fallo individual no bloquea el pipeline. Retorna status="preliminary_failed".
+    - Task 2a: timeout (15h) marca la tarea y la Task 2b correspondiente como failed.
+    - Task 2b: retries=4, retry_delay=30min (polling del lineup oficial).
+    - Task 3: trigger_rule=ALL_DONE — corre aunque alguna Task 2b haya fallado.
 =================================================================================================
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -72,7 +61,9 @@ import structlog
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.sensors.base import PokeReturnValue
 from airflow.utils.trigger_rule import TriggerRule
 
 log = logging.getLogger(__name__)
@@ -95,11 +86,11 @@ _LINEUP_WINDOW_HOURS = 2
 # Si el lineup no llega en este tiempo desde T-2h → el partido ya empezó; usar fallback
 _LINEUP_FALLBACK_AFTER_GAME_START = True
 
-# Intervalo entre polls del LineupSensor (cuando está en la ventana de 2 horas)
-_LINEUP_POLL_SECONDS = 300  # 5 minutos
-
-# Sleep granular dentro del bloque de espera pre-ventana (chunk para heartbeat de Airflow)
+# Intervalo de poke del sensor wait_pregame_window (segundos)
 _WAIT_CHUNK_SECONDS = 60
+
+# Intervalo entre polls del LineupSensor (cuando está en la ventana de 2 horas)
+_LINEUP_POLL_SECONDS = 300  # 5 minutos (vía Airflow retries)
 
 # Reintentos HTTP para llamadas a la MLB API y a la FastAPI interna
 _HTTP_RETRIES = 3
@@ -136,7 +127,7 @@ def _http_get_json(url: str, params: dict | None = None) -> dict:
         except requests.exceptions.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else 0
             if code < 500:
-                raise  # 4xx no reintentable
+                raise
             if attempt == _HTTP_RETRIES:
                 raise
             wait = _HTTP_BACKOFF ** attempt
@@ -148,7 +139,7 @@ def _http_get_json(url: str, params: dict | None = None) -> dict:
             wait = _HTTP_BACKOFF ** attempt
             log.warning("Request error retry %d/%d → %.0fs: %s", attempt, _HTTP_RETRIES, wait, exc)
             time.sleep(wait)
-    raise RuntimeError(f"_http_get_json exhausted retries for {url}")  # inalcanzable
+    raise RuntimeError(f"_http_get_json exhausted retries for {url}")
 
 
 def _http_post_json(url: str, payload: dict, headers: dict | None = None) -> dict:
@@ -180,7 +171,6 @@ def _http_post_json(url: str, payload: dict, headers: dict | None = None) -> dic
 
 def _parse_game_dt_utc(game_date_str: str) -> datetime:
     """Convierte el gameDate de la MLB API (ISO 8601 UTC) en un datetime timezone-aware."""
-    # Formato: "2026-05-19T18:10:00Z" o "2026-05-19T18:10:00.000Z"
     clean = game_date_str.replace("Z", "+00:00")
     dt = datetime.fromisoformat(clean)
     if dt.tzinfo is None:
@@ -189,20 +179,13 @@ def _parse_game_dt_utc(game_date_str: str) -> datetime:
 
 
 def _fetch_schedule_for_date(target_date: str) -> list[dict]:
-    """Obtiene la lista de partidos de la MLB para una fecha dada.
-
-    Args:
-        target_date: Fecha en formato YYYY-MM-DD.
-
-    Returns:
-        Lista de dicts con game_pk, game_date_utc, home/away team info y status.
-    """
+    """Obtiene la lista de partidos de la MLB para una fecha dada."""
     data = _http_get_json(
         f"{_MLB_API_BASE}/schedule",
         params={
             "sportId": _SPORT_ID,
             "date": target_date,
-            "hydrate": "team,venue,status",
+            "hydrate": "team,venue,status,probablePitcher",
         },
     )
     games: list[dict] = []
@@ -220,6 +203,11 @@ def _fetch_schedule_for_date(target_date: str) -> list[dict]:
             home_team = game.get("teams", {}).get("home", {}).get("team", {})
             away_team = game.get("teams", {}).get("away", {}).get("team", {})
 
+            # Extract probable pitchers from hydrated schedule data
+            teams_data = game.get("teams", {})
+            home_probable = teams_data.get("home", {}).get("probablePitcher", {})
+            away_probable = teams_data.get("away", {}).get("probablePitcher", {})
+
             games.append({
                 "game_pk": int(game_pk),
                 "game_date_utc": game_date_str,
@@ -232,6 +220,9 @@ def _fetch_schedule_for_date(target_date: str) -> list[dict]:
                 "venue_name": game.get("venue", {}).get("name", ""),
                 "abstract_state": abstract_state,
                 "detailed_state": detailed_state,
+                # Probable pitchers (available since we now hydrate probablePitcher)
+                "home_probable_pitcher_id": home_probable.get("id"),
+                "away_probable_pitcher_id": away_probable.get("id"),
             })
 
     log.info("Schedule fetched for %s: %d games found.", target_date, len(games))
@@ -239,14 +230,7 @@ def _fetch_schedule_for_date(target_date: str) -> list[dict]:
 
 
 def _sense_lineup(game_pk: int) -> tuple[bool, str, dict]:
-    """Consulta el live-feed de un partido y detecta si el lineup oficial está disponible.
-
-    Returns:
-        (lineup_available: bool, abstract_game_state: str, lineup_data: dict)
-        lineup_data contiene:
-            home_batting_order, away_batting_order,
-            home_starting_pitcher_id, away_starting_pitcher_id
-    """
+    """Consulta el live-feed de un partido y detecta si el lineup oficial está disponible."""
     data = _http_get_json(f"{_MLB_API_V1_1}/game/{game_pk}/feed/live")
 
     game_state = (
@@ -264,7 +248,6 @@ def _sense_lineup(game_pk: int) -> tuple[bool, str, dict]:
     home_pitchers: list[int] = home.get("pitchers", [])
     away_pitchers: list[int] = away.get("pitchers", [])
 
-    # También chequear probablePitchers en gameData si el boxscore está vacío
     if not home_pitchers or not away_pitchers:
         probable = data.get("gameData", {}).get("probablePitchers", {})
         if not home_pitchers and probable.get("home", {}).get("id"):
@@ -290,12 +273,7 @@ def _sense_lineup(game_pk: int) -> tuple[bool, str, dict]:
 
 
 def _fetch_player_career_stats(player_id: int) -> dict | None:
-    """Obtiene estadísticas de carrera de un bateador desde la MLB Stats API.
-
-    Returns:
-        Dict con avg, obp, slg, iso, woba_approx, bat_side, full_name.
-        None si el jugador no tiene estadísticas.
-    """
+    """Obtiene estadísticas de carrera de un bateador desde la MLB Stats API."""
     try:
         data = _http_get_json(
             f"{_MLB_API_BASE}/people/{player_id}",
@@ -319,7 +297,6 @@ def _fetch_player_career_stats(player_id: int) -> dict | None:
                     break
 
         if not career_stats:
-            # Usar promedios de liga si no hay stats de carrera
             return {
                 "player_id": player_id,
                 "full_name": full_name,
@@ -336,8 +313,6 @@ def _fetch_player_career_stats(player_id: int) -> dict | None:
         obp = float(career_stats.get("obp", 0.318) or 0.318)
         slg = float(career_stats.get("slg", 0.398) or 0.398)
         iso = round(max(slg - avg, 0.0), 3)
-        # wOBA aproximado: 0.72*BB + 0.75*HBP + 0.9*1B + 1.25*2B + 1.6*3B + 2.1*HR
-        # Simplificado: (OBP * 1.2 + SLG * 0.7) / 2
         woba_approx = round((obp * 1.2 + slg * 0.7) / 2, 3)
 
         return {
@@ -361,24 +336,19 @@ def _approximate_prob_vector(stats: dict) -> list[float]:
 
     Clases: [OUT_IN_PLAY, STRIKEOUT, WALK_HBP, SINGLE, DOUBLE, TRIPLE, HOME_RUN]
 
-    NOTA DE PRODUCCIÓN:
-        Esta función usa stats de carrera como proxy. En producción, el prob_vector
-        debe calcularse con el modelo AtBatPredictor entrenado sobre features Statcast
-        (rolling windows, platoon splits, park factors). Aquí se usa como fallback
-        cuando el feature store no está disponible en el worker de Airflow.
+    Fallback cuando el feature store no está disponible en el worker de Airflow.
+    En producción el prob_vector debe calcularse con el modelo AtBatPredictor.
     """
     avg = float(stats.get("avg", 0.248))
     obp = float(stats.get("obp", 0.318))
     slg = float(stats.get("slg", 0.398))
 
-    # Tasas aproximadas por PA
-    pa_adj = 0.97  # PA ≈ AB * 1.03, ajuste simple
+    pa_adj = 0.97
     p_bb_hbp = max(round((obp - avg) * pa_adj, 4), 0.04)
-    p_hr = max(round((slg - avg) / 4.2, 4), 0.01)  # muy rough
+    p_hr = max(round((slg - avg) / 4.2, 4), 0.01)
     p_triple = 0.005
     p_double = max(round((slg - avg - p_hr * 3 - p_triple * 2) * 0.35, 4), 0.02)
     p_single = max(round(avg - p_hr - p_triple - p_double, 4), 0.08)
-    # K rate correlaciona negativamente con OBP
     p_k = max(round(0.22 - (obp - 0.310) * 0.6, 4), 0.08)
     p_out = max(round(1.0 - p_bb_hbp - p_hr - p_triple - p_double - p_single - p_k, 4), 0.20)
 
@@ -387,15 +357,23 @@ def _approximate_prob_vector(stats: dict) -> list[float]:
     return [round(x / total, 4) for x in raw]
 
 
-def _build_optimize_request(game_info: dict, lineup_data: dict) -> dict | None:
-    """Construye el payload para POST /v1/optimize/lineup con el lineup confirmado.
+def _build_optimize_request(
+    game_info: dict,
+    lineup_data: dict,
+    fast_mode: bool = True,
+) -> dict | None:
+    """Construye el payload para POST /v1/optimize/lineup.
 
-    Obtiene stats de carrera para cada bateador del home team y construye un
-    PlayerRosterEntry por cada uno. Usa el lanzador abridor del away team como rival.
+    Args:
+        game_info:   Dict producido por fetch_todays_schedule.
+        lineup_data: Dict con home_batting_order, away_batting_order,
+                     home_starting_pitcher_id, away_starting_pitcher_id.
+        fast_mode:   True → 5k sims (preliminary/fallback).
+                     False → 100k sims definitivas (lineup oficial confirmado).
 
     Returns:
-        Payload dict compatible con LineupOptimizeRequest, o None si no se pudo
-        construir el roster completo (< 9 jugadores con stats).
+        Payload dict compatible con LineupOptimizeRequest, o None si no se
+        pudo construir el roster completo (< 9 jugadores con stats).
     """
     home_order = lineup_data.get("home_batting_order", [])
     away_pitcher_id = lineup_data.get("away_starting_pitcher_id")
@@ -403,16 +381,14 @@ def _build_optimize_request(game_info: dict, lineup_data: dict) -> dict | None:
     if len(home_order) < 9:
         log.warning(
             "build_optimize_request: game_pk=%s — home batting order has only %d players",
-            game_info["game_pk"], len(home_order)
+            game_info["game_pk"], len(home_order),
         )
         return None
 
-    # Construir roster de bateadores
     roster: list[dict] = []
     for pid in home_order[:9]:
         stats = _fetch_player_career_stats(int(pid))
         if stats is None:
-            log.warning("No stats for player_id=%s, using league average", pid)
             stats = {
                 "player_id": pid,
                 "full_name": f"Player {pid}",
@@ -436,23 +412,37 @@ def _build_optimize_request(game_info: dict, lineup_data: dict) -> dict | None:
         log.warning("Could not build 9-player roster for game_pk=%s", game_info["game_pk"])
         return None
 
-    # Información del lanzador rival (away pitcher)
     rival_pitcher: dict = {
         "pitcher_id": away_pitcher_id or 0,
         "pitcher_name": f"Pitcher {away_pitcher_id}",
-        "hand": "R",  # default; en producción: fetch de la MLB API
+        "hand": "R",
         "era": 4.00,
         "pitch_mix": {"FF": 0.55, "SL": 0.20, "CH": 0.15, "CB": 0.10},
     }
 
     if away_pitcher_id:
         try:
-            pitcher_data = _http_get_json(f"{_MLB_API_BASE}/people/{away_pitcher_id}")
+            pitcher_data = _http_get_json(
+                f"{_MLB_API_BASE}/people/{away_pitcher_id}",
+                params={"hydrate": "stats(group=[pitching],type=[season])"},
+            )
             people = pitcher_data.get("people", [])
             if people:
                 p = people[0]
                 rival_pitcher["pitcher_name"] = p.get("fullName", rival_pitcher["pitcher_name"])
                 rival_pitcher["hand"] = p.get("pitchHand", {}).get("code", "R")
+                # Extract ERA from season stats if available
+                for s in p.get("stats", []):
+                    if s.get("type", {}).get("displayName") == "season":
+                        splits = s.get("splits", [])
+                        if splits:
+                            stat = splits[0].get("stat", {})
+                            era_str = stat.get("era", "4.00")
+                            try:
+                                rival_pitcher["era"] = float(era_str)
+                            except (ValueError, TypeError):
+                                pass
+                        break
         except Exception as exc:
             log.warning("Failed to fetch pitcher info for id=%s: %s", away_pitcher_id, exc)
 
@@ -466,7 +456,7 @@ def _build_optimize_request(game_info: dict, lineup_data: dict) -> dict | None:
         "roster": roster,
         "rival_pitcher": rival_pitcher,
         "game_id": game_id,
-        "fast_mode": True,  # Pre-game: fast mode (3s) para todos los partidos en paralelo
+        "fast_mode": fast_mode,
         "apply_feedback_overrides": False,
     }
 
@@ -480,35 +470,24 @@ def _save_prediction_to_db(
 ) -> None:
     """Persiste la predicción pre-partido en la tabla gameday_predictions.
 
-    DDL requerido (ejecutar una vez antes del primer run del DAG):
+    Columnas adicionales (requiere migration 002_add_confidence_columns.sql):
+        confidence_score, confidence_level, scorecard_json, defense_report_md
 
-        CREATE TABLE IF NOT EXISTS gameday_predictions (
-            id                       SERIAL PRIMARY KEY,
-            game_pk                  INTEGER NOT NULL,
-            game_date                DATE NOT NULL,
-            home_team_id             INTEGER,
-            away_team_id             INTEGER,
-            home_team_name           VARCHAR(100),
-            away_team_name           VARCHAR(100),
-            home_batting_order       INTEGER[],
-            away_batting_order       INTEGER[],
-            home_starting_pitcher_id INTEGER,
-            away_starting_pitcher_id INTEGER,
-            ai_recommended_lineup    INTEGER[],
-            ai_expected_runs         FLOAT,
-            win_probability          FLOAT,
-            optimization_mode        VARCHAR(10),
-            model_version            VARCHAR(50),
-            lineup_source            VARCHAR(20),
-            predicted_at             TIMESTAMPTZ DEFAULT NOW(),
-            actual_home_runs         INTEGER,
-            actual_away_runs         INTEGER,
-            delta_er                 FLOAT,
-            game_state               VARCHAR(30),
-            resolved_at              TIMESTAMPTZ,
-            UNIQUE (game_pk)
-        );
+    La estrategia UPSERT usa COALESCE para los nuevos campos: si la fila existe
+    con un valor no-NULL (ej. scorecard de la predicción definitiva), no se
+    sobreescribe con NULL (ej. actualización parcial de Task 3 post-partido).
     """
+    # ── Extraer scorecard y defense_report de la respuesta de la API ──────────
+    scorecard: dict | None = prediction.get("scorecard")
+    defense_report: dict | None = prediction.get("defense_report")
+
+    confidence_score: float | None = scorecard.get("confidence_overall") if scorecard else None
+    confidence_level: str | None = scorecard.get("confidence_tier") if scorecard else None
+    scorecard_json: str | None = json.dumps(scorecard) if scorecard else None
+    defense_report_md: str | None = (
+        defense_report.get("markdown_content") if defense_report else None
+    )
+
     upsert_sql = """
         INSERT INTO gameday_predictions (
             game_pk, game_date,
@@ -518,7 +497,8 @@ def _save_prediction_to_db(
             home_starting_pitcher_id, away_starting_pitcher_id,
             ai_recommended_lineup, ai_expected_runs,
             win_probability, optimization_mode,
-            model_version, lineup_source, predicted_at
+            model_version, lineup_source, predicted_at,
+            confidence_score, confidence_level, scorecard_json, defense_report_md
         ) VALUES (
             %(game_pk)s, %(game_date)s,
             %(home_team_id)s, %(away_team_id)s,
@@ -527,32 +507,50 @@ def _save_prediction_to_db(
             %(home_starting_pitcher_id)s, %(away_starting_pitcher_id)s,
             %(ai_recommended_lineup)s, %(ai_expected_runs)s,
             %(win_probability)s, %(optimization_mode)s,
-            %(model_version)s, %(lineup_source)s, NOW()
+            %(model_version)s, %(lineup_source)s, NOW(),
+            %(confidence_score)s, %(confidence_level)s,
+            %(scorecard_json)s::jsonb, %(defense_report_md)s
         )
         ON CONFLICT (game_pk) DO UPDATE SET
             ai_recommended_lineup    = EXCLUDED.ai_recommended_lineup,
             ai_expected_runs         = EXCLUDED.ai_expected_runs,
             win_probability          = EXCLUDED.win_probability,
+            optimization_mode        = EXCLUDED.optimization_mode,
+            model_version            = EXCLUDED.model_version,
             lineup_source            = EXCLUDED.lineup_source,
-            predicted_at             = NOW()
+            predicted_at             = NOW(),
+            home_batting_order       = EXCLUDED.home_batting_order,
+            away_batting_order       = EXCLUDED.away_batting_order,
+            home_starting_pitcher_id = EXCLUDED.home_starting_pitcher_id,
+            away_starting_pitcher_id = EXCLUDED.away_starting_pitcher_id,
+            -- COALESCE: preserve existing non-NULL scorecard/defense_report when
+            -- updating with a preliminary prediction that has NULL fields.
+            confidence_score  = COALESCE(EXCLUDED.confidence_score,  gameday_predictions.confidence_score),
+            confidence_level  = COALESCE(EXCLUDED.confidence_level,  gameday_predictions.confidence_level),
+            scorecard_json    = COALESCE(EXCLUDED.scorecard_json,    gameday_predictions.scorecard_json),
+            defense_report_md = COALESCE(EXCLUDED.defense_report_md, gameday_predictions.defense_report_md)
     """
     params = {
-        "game_pk": game_info["game_pk"],
-        "game_date": game_info["game_date_utc"][:10],
-        "home_team_id": game_info["home_team_id"],
-        "away_team_id": game_info["away_team_id"],
-        "home_team_name": game_info["home_team_name"],
-        "away_team_name": game_info["away_team_name"],
-        "home_batting_order": lineup_data.get("home_batting_order", []),
-        "away_batting_order": lineup_data.get("away_batting_order", []),
-        "home_starting_pitcher_id": lineup_data.get("home_starting_pitcher_id"),
-        "away_starting_pitcher_id": lineup_data.get("away_starting_pitcher_id"),
-        "ai_recommended_lineup": prediction.get("lineup_player_ids", []),
-        "ai_expected_runs": prediction.get("expected_runs", 0.0),
-        "win_probability": prediction.get("win_probability", 0.0),
-        "optimization_mode": prediction.get("optimization_mode", "fast"),
-        "model_version": prediction.get("model_version", "unknown"),
-        "lineup_source": lineup_source,
+        "game_pk":                   game_info["game_pk"],
+        "game_date":                 game_info["game_date_utc"][:10],
+        "home_team_id":              game_info["home_team_id"],
+        "away_team_id":              game_info["away_team_id"],
+        "home_team_name":            game_info["home_team_name"],
+        "away_team_name":            game_info["away_team_name"],
+        "home_batting_order":        lineup_data.get("home_batting_order", []),
+        "away_batting_order":        lineup_data.get("away_batting_order", []),
+        "home_starting_pitcher_id":  lineup_data.get("home_starting_pitcher_id"),
+        "away_starting_pitcher_id":  lineup_data.get("away_starting_pitcher_id"),
+        "ai_recommended_lineup":     prediction.get("lineup_player_ids", []),
+        "ai_expected_runs":          prediction.get("expected_runs", 0.0),
+        "win_probability":           prediction.get("win_probability", 0.0),
+        "optimization_mode":         prediction.get("optimization_mode", "fast"),
+        "model_version":             prediction.get("model_version", "unknown"),
+        "lineup_source":             lineup_source,
+        "confidence_score":          confidence_score,
+        "confidence_level":          confidence_level,
+        "scorecard_json":            scorecard_json,
+        "defense_report_md":         defense_report_md,
     }
     conn = pg_hook.get_conn()
     cur = conn.cursor()
@@ -561,8 +559,10 @@ def _save_prediction_to_db(
     slog.info(
         "prediction_saved_to_db",
         game_pk=game_info["game_pk"],
-        ai_expected_runs=params["ai_expected_runs"],
         lineup_source=lineup_source,
+        ai_expected_runs=params["ai_expected_runs"],
+        confidence_level=confidence_level,
+        has_defense_report=defense_report_md is not None,
     )
 
 
@@ -574,8 +574,9 @@ def _save_prediction_to_db(
 @dag(
     dag_id="mlb_gameday_orchestrator",
     description=(
-        "Game-Day Orchestrator: lineup sensing T-2h → pre-game inference → "
-        "post-game delta E[R] evaluation. Dynamic Task Mapping (1 instancia/partido)."
+        "Game-Day Orchestrator v2: preliminary sim (08:00 UTC) + "
+        "DateTimeSensor (T-2h, mode=reschedule) + definitive optimization "
+        "(100k sims) + post-game eval + TriggerDagRun → mlb_nightly_training."
     ),
     schedule="0 8 * * *",  # 08:00 UTC = 10:00 Madrid = 04:00 EDT
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
@@ -586,7 +587,7 @@ def _save_prediction_to_db(
     doc_md=__doc__,
 )
 def mlb_gameday_orchestrator():
-    """DAG del Game-Day Orchestrator del MLB Lineup Optimizer."""
+    """DAG del Game-Day Orchestrator v2 del MLB Lineup Optimizer."""
 
     # ===================================================================
     # TASK 1 — Fetch Today's Schedule
@@ -594,14 +595,11 @@ def mlb_gameday_orchestrator():
 
     @task(task_id="fetch_todays_schedule")
     def fetch_todays_schedule(**context) -> list[dict]:
-        """Obtiene los partidos MLB programados para hoy desde la StatsAPI.
+        """Obtiene los partidos MLB para hoy, incluyendo probable pitchers.
 
-        Usa la logical_date del DAG run como fecha objetivo para garantizar
-        idempotencia en backfills.
-
-        Returns:
-            Lista de dicts con game_pk, game_date_utc, team info y estado.
-            Lista vacía si no hay partidos hoy (día sin MLB).
+        Usa la logical_date del DAG run para garantizar idempotencia en backfills.
+        El hydrate=probablePitcher permite que preliminary_optimization tenga
+        el probable pitcher sin llamadas adicionales.
         """
         logical_date: pendulum.DateTime = context["logical_date"]
         target_date = logical_date.in_timezone("UTC").strftime("%Y-%m-%d")
@@ -620,8 +618,6 @@ def mlb_gameday_orchestrator():
 
         if not games:
             slog.info("no_games_today", target_date=target_date)
-            # Lanzar AirflowSkipException vacía la lista y las tareas downstream
-            # se marcan como Skipped en el UI de Airflow
             raise AirflowSkipException(f"No MLB games scheduled for {target_date}")
 
         slog.info(
@@ -634,92 +630,192 @@ def mlb_gameday_orchestrator():
         return games
 
     # ===================================================================
-    # TASK 2 — Game Pipeline (Dynamic Map — una instancia por partido)
+    # TASK P — Preliminary Optimization (corre inmediatamente, sin esperar T-2h)
     # ===================================================================
 
     @task(
-        task_id="game_pipeline_dynamic_map",
-        retries=4,
-        retry_delay=timedelta(minutes=30),
-        # Importante: execution_timeout generoso para partidos de tarde/noche.
-        # Un partido de Costa Oeste puede empezar a las 22:10 UTC; la tarea
-        # podría esperar hasta las 20:10 UTC → ~12 horas de espera máxima.
-        # En producción: reemplazar el bloque de espera por DateTimeSensor(mode="reschedule").
-        execution_timeout=timedelta(hours=15),
+        task_id="preliminary_optimization",
+        retries=1,
+        retry_delay=timedelta(minutes=3),
+        execution_timeout=timedelta(minutes=10),
     )
-    def game_pipeline_dynamic_map(game_info: dict, **context) -> dict:
-        """Flujo completo pre-partido para un único gamePk.
+    def preliminary_optimization(game_info: dict, **context) -> dict:
+        """Simulación preliminar en fast_mode usando probable pitcher + roster proyectado.
 
-        Etapas internas:
-            1. Calcular ventana T-2h y esperar hasta ella.
-            2. LineupSensor: consultar el lineup oficial.
-               → Si no está: raise AirflowException → retry en 30 min.
-               → Si el partido ya empezó sin lineup: usar roster proyectado.
-            3. Construir request de optimización con lineup confirmado.
-            4. Llamar a /v1/optimize/lineup en la FastAPI interna.
-            5. Guardar predicción en PostgreSQL.
+        Escribe gameday_predictions con lineup_source="preliminary" a las 08:00 UTC,
+        permitiendo que Streamlit War Room muestre predicciones antes de T-2h.
 
-        Args:
-            game_info: Dict producido por fetch_todays_schedule.
-
-        Returns:
-            Dict con game_pk, lineup_source, ai_expected_runs, status.
+        Los fallos individuales no bloquean el pipeline — se loguean y se retornan
+        como status="preliminary_failed" para que Task 3 los detecte.
         """
         game_pk: int = game_info["game_pk"]
-        game_dt_utc: datetime = _parse_game_dt_utc(game_info["game_date_utc"])
-        game_dt_et = game_dt_utc.astimezone(_ET_TZ)
         matchup = f"{game_info['away_team_name']} @ {game_info['home_team_name']}"
-        now_utc = datetime.now(_UTC)
+
+        slog.info("preliminary_optimization_start", game_pk=game_pk, matchup=matchup)
+
+        # Construir lineup proyectado (40-Man roster del home team)
+        lineup_data = _build_projected_lineup(
+            game_info["home_team_id"],
+            game_info["away_team_id"],
+        )
+
+        # Usar el probable pitcher (ya disponible en game_info desde fetch_schedule)
+        away_probable_id = game_info.get("away_probable_pitcher_id")
+        if away_probable_id:
+            lineup_data["away_starting_pitcher_id"] = int(away_probable_id)
+
+        optimize_payload = _build_optimize_request(game_info, lineup_data, fast_mode=True)
+        if optimize_payload is None:
+            slog.warning("preliminary_roster_build_failed", game_pk=game_pk, matchup=matchup)
+            return {
+                "game_pk": game_pk,
+                "matchup": matchup,
+                "lineup_source": "preliminary",
+                "ai_expected_runs": None,
+                "status": "preliminary_skipped_no_roster",
+            }
+
+        api_url = Variable.get("MLB_API_INFERENCE_URL", default_var="http://mlb_api:8000")
+        try:
+            prediction = _http_post_json(
+                f"{api_url}/v1/optimize/lineup",
+                payload=optimize_payload,
+            )
+        except Exception as exc:
+            slog.warning(
+                "preliminary_inference_failed",
+                game_pk=game_pk,
+                matchup=matchup,
+                error=str(exc),
+            )
+            # Non-fatal: log + return. Official prediction at T-2h is the definitive one.
+            return {
+                "game_pk": game_pk,
+                "matchup": matchup,
+                "lineup_source": "preliminary",
+                "ai_expected_runs": None,
+                "status": f"preliminary_inference_failed: {exc}",
+            }
+
+        pg_hook = PostgresHook(postgres_conn_id=_PG_CONN_ID)
+        try:
+            _save_prediction_to_db(pg_hook, game_info, lineup_data, prediction, "preliminary")
+        except Exception as exc:
+            slog.error("preliminary_db_save_failed", game_pk=game_pk, error=str(exc))
+            return {
+                "game_pk": game_pk,
+                "matchup": matchup,
+                "lineup_source": "preliminary",
+                "ai_expected_runs": prediction.get("expected_runs"),
+                "status": f"preliminary_db_failed: {exc}",
+            }
 
         slog.info(
-            "game_pipeline_start",
+            "preliminary_optimization_complete",
             game_pk=game_pk,
             matchup=matchup,
-            first_pitch_utc=game_dt_utc.strftime("%Y-%m-%d %H:%M UTC"),
-            first_pitch_et=game_dt_et.strftime("%H:%M ET"),
+            ai_expected_runs=prediction.get("expected_runs"),
+            win_probability=prediction.get("win_probability"),
+        )
+        return {
+            "game_pk": game_pk,
+            "matchup": matchup,
+            "lineup_source": "preliminary",
+            "ai_expected_runs": prediction.get("expected_runs"),
+            "win_probability": prediction.get("win_probability"),
+            "status": "ok",
+        }
+
+    # ===================================================================
+    # TASK 2a — Wait Pregame Window (sensor, mode="reschedule")
+    # ===================================================================
+
+    @task.sensor(
+        task_id="wait_pregame_window",
+        mode="reschedule",        # libera el worker slot entre pokes
+        poke_interval=_WAIT_CHUNK_SECONDS,
+        timeout=int(timedelta(hours=15).total_seconds()),  # partidos de Costa Oeste
+        soft_fail=False,
+    )
+    def wait_pregame_window(game_info: dict) -> PokeReturnValue:
+        """Sensor que espera la ventana T-2h antes del primer pitch.
+
+        Usa mode="reschedule" para NO mantener el worker slot ocupado durante
+        la espera (que puede ser de hasta 12 horas para partidos de Costa Oeste).
+        El worker se libera entre pokes y solo se reactiva cada 60 segundos.
+
+        PokeReturnValue(is_done=True) hace avanzar la Task 2b correspondiente.
+        """
+        game_pk = game_info["game_pk"]
+        game_dt_utc = _parse_game_dt_utc(game_info["game_date_utc"])
+        window_start_utc = game_dt_utc - timedelta(hours=_LINEUP_WINDOW_HOURS)
+        now_utc = datetime.now(_UTC)
+
+        is_ready = now_utc >= window_start_utc
+
+        if not is_ready:
+            remaining_s = (window_start_utc - now_utc).total_seconds()
+            slog.debug(
+                "pregame_window_not_yet",
+                game_pk=game_pk,
+                window_start_utc=window_start_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                remaining_minutes=round(remaining_s / 60, 1),
+            )
+        else:
+            slog.info(
+                "pregame_window_reached",
+                game_pk=game_pk,
+                matchup=f"{game_info['away_team_name']} @ {game_info['home_team_name']}",
+            )
+
+        return PokeReturnValue(is_done=is_ready)
+
+    # ===================================================================
+    # TASK 2b — Lineup Sense and Optimize (corre después de wait_pregame_window[i])
+    # ===================================================================
+
+    @task(
+        task_id="lineup_sense_and_optimize",
+        retries=4,
+        retry_delay=timedelta(minutes=30),
+        execution_timeout=timedelta(hours=2),
+    )
+    def lineup_sense_and_optimize(game_info: dict, **context) -> dict:
+        """Sensing del lineup oficial + optimización definitiva para un único gamePk.
+
+        PRECONDICIÓN: wait_pregame_window[i] completó — ya estamos en la ventana T-2h.
+
+        Etapas:
+            1. LineupSensor: consultar lineup oficial.
+               → Si disponible: fast_mode=False (100k sims — decisión definitiva).
+               → Si partido ya inició sin lineup: roster proyectado, fast_mode=True.
+               → Si no disponible y no inició: raise AirflowException → retry 30min.
+            2. POST /v1/optimize/lineup con los params correctos.
+            3. UPSERT en gameday_predictions (sobrescribe el registro "preliminary").
+               Persiste confidence_score, confidence_level, scorecard_json,
+               defense_report_md del modo full (100k sims).
+        """
+        game_pk: int = game_info["game_pk"]
+        matchup = f"{game_info['away_team_name']} @ {game_info['home_team_name']}"
+
+        slog.info(
+            "lineup_sense_start",
+            game_pk=game_pk,
+            matchup=matchup,
             map_index=context.get("map_index_template", "?"),
         )
 
         # ------------------------------------------------------------------
-        # Etapa 2a: Espera hasta la ventana T-2h
-        # ------------------------------------------------------------------
-        window_start_utc = game_dt_utc - timedelta(hours=_LINEUP_WINDOW_HOURS)
-        now_utc = datetime.now(_UTC)
-
-        if now_utc < window_start_utc:
-            wait_seconds = (window_start_utc - now_utc).total_seconds()
-            slog.info(
-                "waiting_for_pregame_window",
-                game_pk=game_pk,
-                window_start_utc=window_start_utc.strftime("%H:%M UTC"),
-                wait_minutes=round(wait_seconds / 60, 1),
-            )
-            # NOTA DE PRODUCCIÓN:
-            # Reemplazar este bucle por DateTimeSensor para liberar el worker:
-            #
-            #   from airflow.sensors.time_sensor import TimeSensor
-            #   TimeSensor(
-            #       task_id=f"wait_window_{game_pk}",
-            #       target_time=window_start_utc.time(),
-            #       mode="reschedule",
-            #   )
-            #
-            # Con time.sleep() en chunks de 60s el worker queda ocupado
-            # pero funciona correctamente en entornos de worker dedicado.
-            while datetime.now(_UTC) < window_start_utc:
-                remaining = (window_start_utc - datetime.now(_UTC)).total_seconds()
-                time.sleep(min(_WAIT_CHUNK_SECONDS, max(remaining, 1)))
-
-        slog.info("pregame_window_reached", game_pk=game_pk, matchup=matchup)
-
-        # ------------------------------------------------------------------
-        # Etapa 2b: LineupSensor
+        # Etapa 1: LineupSensor (ya estamos en la ventana T-2h)
         # ------------------------------------------------------------------
         lineup_available, game_state, lineup_data = _sense_lineup(game_pk)
 
+        fast_mode: bool
         lineup_source: str
+
         if lineup_available:
             lineup_source = "official"
+            fast_mode = False  # Decisión definitiva: 100k simulaciones
             slog.info(
                 "lineup_confirmed",
                 game_pk=game_pk,
@@ -728,8 +824,8 @@ def mlb_gameday_orchestrator():
                 home_order=lineup_data["home_batting_order"],
                 home_starter=lineup_data["home_starting_pitcher_id"],
             )
+
         elif game_state in ("Live", "In Progress", "Final", "Game Over"):
-            # El partido ya comenzó o terminó sin lineup oficial publicado
             if not _LINEUP_FALLBACK_AFTER_GAME_START:
                 slog.warning(
                     "lineup_never_published_skipping",
@@ -744,7 +840,6 @@ def mlb_gameday_orchestrator():
                     "status": "skipped_no_lineup",
                 }
 
-            # Fallback: usar el roster 40-Man del home team
             slog.warning(
                 "lineup_fallback_to_projected",
                 game_pk=game_pk,
@@ -756,15 +851,17 @@ def mlb_gameday_orchestrator():
                 game_info["away_team_id"],
             )
             lineup_source = "projected"
+            fast_mode = True  # Game already started: best-effort fast estimate
 
         else:
-            # Lineup aún no publicado y el partido no ha comenzado → reintento
             slog.warning(
                 "lineup_not_available_triggering_retry",
                 game_pk=game_pk,
                 game_state=game_state,
                 matchup=matchup,
-                retries_remaining=context["task_instance"].max_tries - context["task_instance"].try_number,
+                retries_remaining=(
+                    context["task_instance"].max_tries - context["task_instance"].try_number
+                ),
             )
             raise AirflowException(
                 f"game_pk={game_pk} ({matchup}): lineup not published yet "
@@ -772,9 +869,9 @@ def mlb_gameday_orchestrator():
             )
 
         # ------------------------------------------------------------------
-        # Etapa 2c: Pre-game Inference
+        # Etapa 2: Optimización
         # ------------------------------------------------------------------
-        optimize_payload = _build_optimize_request(game_info, lineup_data)
+        optimize_payload = _build_optimize_request(game_info, lineup_data, fast_mode=fast_mode)
         if optimize_payload is None:
             slog.warning(
                 "optimize_request_build_failed",
@@ -790,7 +887,7 @@ def mlb_gameday_orchestrator():
                 "status": "inference_skipped",
             }
 
-        api_url = Variable.get("MLB_API_INFERENCE_URL", default_var="http://api:8000")
+        api_url = Variable.get("MLB_API_INFERENCE_URL", default_var="http://mlb_api:8000")
 
         try:
             prediction = _http_post_json(
@@ -804,7 +901,6 @@ def mlb_gameday_orchestrator():
                 matchup=matchup,
                 error=str(exc),
             )
-            # Fallo de inferencia no es crítico para el pipeline general — log + continúa
             return {
                 "game_pk": game_pk,
                 "matchup": matchup,
@@ -817,14 +913,16 @@ def mlb_gameday_orchestrator():
             "preinference_complete",
             game_pk=game_pk,
             matchup=matchup,
+            fast_mode=fast_mode,
             ai_expected_runs=prediction.get("expected_runs"),
             win_probability=prediction.get("win_probability"),
-            model_version=prediction.get("model_version"),
-            lineup_source=lineup_source,
+            confidence_level=prediction.get("scorecard", {}) and
+                             prediction["scorecard"].get("confidence_tier"),
+            has_defense_report=prediction.get("defense_report") is not None,
         )
 
         # ------------------------------------------------------------------
-        # Etapa 2d: Guardar en PostgreSQL
+        # Etapa 3: UPSERT en PostgreSQL
         # ------------------------------------------------------------------
         pg_hook = PostgresHook(postgres_conn_id=_PG_CONN_ID)
         try:
@@ -835,16 +933,20 @@ def mlb_gameday_orchestrator():
                 game_pk=game_pk,
                 error=str(exc),
             )
-            # No bloqueamos el pipeline si falla la BD; el error se propaga en Task 3
             raise AirflowException(f"game_pk={game_pk}: DB save failed: {exc}") from exc
 
         return {
             "game_pk": game_pk,
             "matchup": matchup,
             "lineup_source": lineup_source,
+            "fast_mode": fast_mode,
             "ai_expected_runs": prediction.get("expected_runs"),
             "win_probability": prediction.get("win_probability"),
             "model_version": prediction.get("model_version"),
+            "confidence_level": (
+                prediction.get("scorecard", {}) and
+                prediction["scorecard"].get("confidence_tier")
+            ),
             "status": "ok",
         }
 
@@ -854,7 +956,7 @@ def mlb_gameday_orchestrator():
 
     @task(
         task_id="await_and_resolve_all_games",
-        trigger_rule=TriggerRule.ALL_DONE,  # corre aunque alguna Task 2 haya fallado
+        trigger_rule=TriggerRule.ALL_DONE,
         retries=2,
         retry_delay=timedelta(minutes=15),
         execution_timeout=timedelta(hours=10),
@@ -862,7 +964,7 @@ def mlb_gameday_orchestrator():
     def await_and_resolve_all_games(games: list[dict], **context) -> dict:
         """Evaluación analítica post-partido de todos los juegos del día.
 
-        Se ejecuta cuando TODAS las instancias de game_pipeline_dynamic_map
+        Se ejecuta cuando TODAS las instancias de lineup_sense_and_optimize
         han terminado (éxito o fallo). Usa PostGameEvaluator para:
             - Esperar que todos los partidos lleguen a estado Final.
             - Descargar boxscores y cruzar con predicciones en DB.
@@ -871,12 +973,8 @@ def mlb_gameday_orchestrator():
             - Guardar resoluciones en PostgreSQL.
             - Notificar por Slack.
 
-        Args:
-            games: Lista de dicts con info de los partidos del día
-                   (output de fetch_todays_schedule).
-
-        Returns:
-            Dict con DayMetrics serializado.
+        El TriggerDagRunOperator hacia mlb_nightly_training se define en el
+        wiring del DAG (fuera de esta task) y se ejecuta tras su completion.
         """
         from src.orchestration.post_game_evaluator import PostGameEvaluator
 
@@ -920,25 +1018,45 @@ def mlb_gameday_orchestrator():
         )
 
         return {
-            "game_date": metrics.game_date,
-            "total_games": metrics.total_games,
-            "games_resolved": metrics.games_resolved,
+            "game_date":        metrics.game_date,
+            "total_games":      metrics.total_games,
+            "games_resolved":   metrics.games_resolved,
             "games_with_error": metrics.games_with_error,
-            "mae": metrics.mae,
-            "rmse": metrics.rmse,
-            "mean_delta_er": metrics.mean_delta_er,
-            "model_version": metrics.model_version,
+            "mae":              metrics.mae,
+            "rmse":             metrics.rmse,
+            "mean_delta_er":    metrics.mean_delta_er,
+            "model_version":    metrics.model_version,
         }
 
     # ===================================================================
     # Wiring — dependencias del DAG
     # ===================================================================
     games_list = fetch_todays_schedule()
-    game_results = game_pipeline_dynamic_map.expand(game_info=games_list)
-    resolve_task = await_and_resolve_all_games(games=games_list)
 
-    # Task 3 depende explícitamente de TODAS las instancias del mapa
-    game_results >> resolve_task
+    # Task P: simulación preliminar inmediata (depende solo de Task 1)
+    preliminary_results = preliminary_optimization.expand(game_info=games_list)
+
+    # Task 2a: sensor por partido (libera workers mientras espera T-2h)
+    wait_sensors = wait_pregame_window.expand(game_info=games_list)
+
+    # Task 2b: sense + optimize definitivo — cada [i] depende de wait_sensors[i]
+    official_results = lineup_sense_and_optimize.expand(game_info=games_list)
+    wait_sensors >> official_results
+
+    # Task 3: post-game eval — espera que TODOS los preliminary Y official terminen
+    resolve_task = await_and_resolve_all_games(games=games_list)
+    [preliminary_results, official_results] >> resolve_task
+
+    # Trigger del pipeline de reentrenamiento nocturno al finalizar la evaluación
+    trigger_training = TriggerDagRunOperator(
+        task_id="trigger_nightly_training",
+        trigger_dag_id="mlb_nightly_training",
+        conf={"game_date": "{{ ds }}"},
+        wait_for_completion=False,  # No bloquear el DAG esperando el entrenamiento
+        reset_dag_run=False,
+        poke_interval=30,
+    )
+    resolve_task >> trigger_training
 
 
 # ---------------------------------------------------------------------------
@@ -949,8 +1067,8 @@ def mlb_gameday_orchestrator():
 def _build_projected_lineup(home_team_id: int, away_team_id: int) -> dict:
     """Construye un lineup proyectado usando el roster 40-Man del home team.
 
-    Fallback cuando el lineup oficial no fue publicado antes del primer pitch.
-    Toma los primeros 9 bateadores del roster activo, ordenados por tipo de posición.
+    Fallback cuando el lineup oficial no fue publicado antes del primer pitch,
+    o para la predicción preliminar de las 08:00 UTC.
     """
     try:
         data = _http_get_json(
@@ -959,9 +1077,10 @@ def _build_projected_lineup(home_team_id: int, away_team_id: int) -> dict:
         )
         roster_entries = data.get("roster", [])
 
-        # Priorizar posiciones ofensivas: C, 1B, 2B, 3B, SS, LF, CF, RF, DH
-        position_priority = {"DH": 0, "RF": 1, "LF": 2, "CF": 3, "1B": 4,
-                             "3B": 5, "SS": 6, "2B": 7, "C": 8}
+        position_priority = {
+            "DH": 0, "RF": 1, "LF": 2, "CF": 3,
+            "1B": 4, "3B": 5, "SS": 6, "2B": 7, "C": 8,
+        }
 
         batters = []
         for entry in roster_entries:
@@ -981,14 +1100,12 @@ def _build_projected_lineup(home_team_id: int, away_team_id: int) -> dict:
         projected_order = [b["player_id"] for b in batters[:9]]
 
         if len(projected_order) < 9:
-            # Pad con ceros si el roster tiene menos de 9 posiciones ofensivas
             projected_order += [0] * (9 - len(projected_order))
 
     except Exception as exc:
         log.warning("Projected lineup fetch failed for team_id=%s: %s", home_team_id, exc)
         projected_order = [0] * 9
 
-    # Para el pitcher rival (away team) usamos el probable pitcher
     away_pitcher_id = None
     try:
         pitcher_data = _http_get_json(
@@ -1003,18 +1120,15 @@ def _build_projected_lineup(home_team_id: int, away_team_id: int) -> dict:
         log.warning("Away pitcher fetch failed for team_id=%s: %s", away_team_id, exc)
 
     return {
-        "home_batting_order": projected_order,
-        "away_batting_order": [0] * 9,
-        "home_starting_pitcher_id": None,
-        "away_starting_pitcher_id": away_pitcher_id,
+        "home_batting_order":        projected_order,
+        "away_batting_order":        [0] * 9,
+        "home_starting_pitcher_id":  None,
+        "away_starting_pitcher_id":  away_pitcher_id,
     }
 
 
 def _build_postgres_dsn() -> str:
-    """Construye el DSN de psycopg2 desde la Airflow Connection 'mlb_predictions_db'.
-
-    Fallback: variable de entorno MLB_POSTGRES_DSN si la Connection no existe.
-    """
+    """Construye el DSN de psycopg2 desde la Airflow Connection 'mlb_predictions_db'."""
     try:
         pg_hook = PostgresHook(postgres_conn_id=_PG_CONN_ID)
         conn = pg_hook.get_connection(_PG_CONN_ID)
@@ -1033,7 +1147,7 @@ def _build_postgres_dsn() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Instancia del DAG (requerido por Airflow para descubrir el DAG en el scheduler)
+# Instancia del DAG (requerido por Airflow para el scheduler)
 # ---------------------------------------------------------------------------
 
 dag_instance = mlb_gameday_orchestrator()

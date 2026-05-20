@@ -229,7 +229,7 @@ def render_war_room() -> None:
     st.divider()
 
     # ── Lineup data ────────────────────────────────────────────────────────────
-    with st.spinner("Generando lineup óptimo…"):
+    with st.spinner("Generando lineup óptimo… (primera carga ~50s si Airflow aún no corrió)"):
         data = get_game_lineup(game_pk)
 
     # ── KPI Cards ──────────────────────────────────────────────────────────────

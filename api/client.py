@@ -17,7 +17,7 @@ from datetime import date, timedelta
 import streamlit as st
 
 API_BASE:   str  = os.environ.get("API_BASE_URL", "http://localhost:8000")
-DEMO_MODE:  bool = os.environ.get("DEMO_MODE", "1") == "1"
+DEMO_MODE:  bool = os.environ.get("DEMO_MODE", "0") == "1"
 _API_TOKEN: str  = os.environ.get("MLB_API_TOKEN", "")
 
 
@@ -159,21 +159,21 @@ def get_todays_games() -> list[dict]:
 # Lineup óptimo
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_game_lineup(game_pk: int) -> dict:
     """
     Lineup óptimo + métricas + explicación RAG.
 
     REAL API CALL:
         import httpx
-        r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", timeout=30)
+        r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", timeout=120)
         r.raise_for_status()
         return r.json()
     """
     if not DEMO_MODE:
         try:
             import httpx
-            r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", headers=_auth_headers(), timeout=30)
+            r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", headers=_auth_headers(), timeout=120)
             r.raise_for_status()
             return r.json()
         except Exception as exc:

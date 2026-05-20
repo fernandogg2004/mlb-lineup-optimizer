@@ -71,6 +71,28 @@ volumes:
 # ---------------------------------------------------------------------------
 services:
 
+  # ── War Room (Streamlit) ──────────────────────────────────────────────────
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    restart: unless-stopped
+    environment:
+      API_BASE_URL: http://mlb_api:8000
+      DEMO_MODE: '0'
+    ports:
+      - "8501:8501"
+    depends_on:
+      mlb_api:
+        condition: service_healthy
+    networks:
+      - mlb_net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
   # ── API de inferencia ─────────────────────────────────────────────────────
   mlb_api:
     build:

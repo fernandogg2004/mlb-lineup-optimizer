@@ -108,6 +108,8 @@ services:
       EXPERIMENT_STORE_PATH: /opt/app-data/gold/ab_experiment
       MLFLOW_TRACKING_URI: /opt/mlruns
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.1-8b-instant}
       PORT: '8000'
       # PostgreSQL — dashboard read endpoints
       POSTGRES_HOST: postgres-mlb

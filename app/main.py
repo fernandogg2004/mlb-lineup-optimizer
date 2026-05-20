@@ -1308,30 +1308,55 @@ def _generate_lineup_explanation(
         else "Predicción generada por Airflow (lineup oficial confirmado)."
     )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
+    system_prompt = (
+        f"Eres el analista táctico del equipo {home_name}. "
+        f"El oponente de hoy es {away_name} con el lanzador abridor "
+        f"{pitcher_name} ({pitcher_hand}HP, ERA {pitcher_era:.2f}).\n\n"
+        f"El motor Monte Carlo generó el siguiente lineup óptimo:\n{lineup_text}\n\n"
+        f"Redacta un briefing táctico pre-partido en Markdown (máx 350 palabras) que explique:\n"
+        f"1. Por qué cada slot del orden de bateo está asignado a ese jugador\n"
+        f"2. Cómo el perfil de {pitcher_name} afecta las decisiones (mano, ERA, pitch mix estimado)\n"
+        f"3. Una alerta de platoon o sustitución de banca si aplica\n"
+        f"Sé conciso, usa negrita para nombres de jugadores y métricas clave."
+    )
+
+    # Anthropic Claude
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if anthropic_key:
         try:
             import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-            prompt = (
-                f"Eres el analista táctico del equipo {home_name}. "
-                f"El oponente de hoy es {away_name} con el lanzador abridor "
-                f"{pitcher_name} ({pitcher_hand}HP, ERA {pitcher_era:.2f}).\n\n"
-                f"El motor Monte Carlo generó el siguiente lineup óptimo:\n{lineup_text}\n\n"
-                f"Redacta un briefing táctico pre-partido en Markdown (máx 350 palabras) que explique:\n"
-                f"1. Por qué cada slot del orden de bateo está asignado a ese jugador\n"
-                f"2. Cómo el perfil de {pitcher_name} afecta las decisiones (mano, ERA, pitch mix estimado)\n"
-                f"3. Una alerta de platoon o sustitución de banca si aplica\n"
-                f"Sé conciso, usa negrita para nombres de jugadores y métricas clave."
-            )
+            client = anthropic.Anthropic(api_key=anthropic_key)
             msg = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=600,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": system_prompt}],
             )
             return f"## Análisis Táctico — {away_name} @ {home_name}\n\n{msg.content[0].text}\n\n---\n*{source_note}*"
         except Exception as exc:
             logger.warning("claude_explanation_failed", error=str(exc))
+
+    # Groq / cualquier API compatible con OpenAI (gratis)
+    groq_key  = os.environ.get("GROQ_API_KEY", "")
+    oai_key   = os.environ.get("OPENAI_API_KEY", "")
+    oai_base  = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    llm_key   = groq_key or oai_key
+    llm_base  = "https://api.groq.com/openai/v1" if groq_key else oai_base
+    llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant" if groq_key else "gpt-4o-mini")
+    if llm_key:
+        try:
+            import httpx
+            resp = httpx.post(
+                f"{llm_base}/chat/completions",
+                headers={"Authorization": f"Bearer {llm_key}", "Content-Type": "application/json"},
+                json={"model": llm_model, "messages": [{"role": "user", "content": system_prompt}],
+                      "max_tokens": 600, "temperature": 0.7},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"]
+            return f"## Análisis Táctico — {away_name} @ {home_name}\n\n{text}\n\n---\n*{source_note}*"
+        except Exception as exc:
+            logger.warning("llm_explanation_failed", provider=llm_base, error=str(exc))
 
     # Rich template fallback (no API key)
     top3 = sorted(lineup, key=lambda p: p.get("obp", 0), reverse=True)[:3]
@@ -1357,7 +1382,7 @@ def _generate_lineup_explanation(
         f"{', '.join(f'**{p[\"name\"]}** (ISO {p.get(\"iso\",0):.3f})' for p in power)}"
         f"{platoon}\n\n"
         f"---\n*{source_note}*\n\n"
-        f"> 💡 Agrega `ANTHROPIC_API_KEY` al entorno para análisis táctico generado por IA."
+        f"> 💡 Agrega `GROQ_API_KEY` (gratis en console.groq.com) para análisis táctico generado por IA."
     )
 
 

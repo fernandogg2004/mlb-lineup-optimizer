@@ -270,8 +270,8 @@ def render_war_room() -> None:
         _lineup_table(data["lineup"])
 
         with st.expander(
-            "🤖 Análisis RAG — Por qué este lineup (LLM + Scouting)",
-            expanded=False,
+            "🤖 Análisis Táctico — Por qué este lineup",
+            expanded=True,
         ):
             st.markdown(data["rag_explanation"])
 

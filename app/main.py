@@ -1285,6 +1285,82 @@ def _approx_prob_vector(avg: float, obp: float, slg: float) -> list[float]:
     return [round(x / total, 4) for x in raw]
 
 
+def _generate_lineup_explanation(
+    lineup: list[dict],
+    pitcher_name: str,
+    pitcher_hand: str,
+    pitcher_era: float,
+    away_name: str,
+    home_name: str,
+    optimization_mode: str = "on_demand_fast",
+) -> str:
+    """Generate tactical lineup explanation via Claude, with rich template fallback."""
+    import os
+
+    lineup_text = "\n".join(
+        f"  #{p['order']} {p['name']} ({p.get('pos','?')}, {p.get('hand','?')}HB) "
+        f"— OBP {p.get('obp',0):.3f} · wOBA {p.get('woba',0):.3f} · ISO {p.get('iso',0):.3f}"
+        for p in lineup
+    )
+    source_note = (
+        "Predicción on-demand (fast mode, 5k sims). La predicción definitiva llega a T-2h via Airflow."
+        if optimization_mode == "on_demand_fast"
+        else "Predicción generada por Airflow (lineup oficial confirmado)."
+    )
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            prompt = (
+                f"Eres el analista táctico del equipo {home_name}. "
+                f"El oponente de hoy es {away_name} con el lanzador abridor "
+                f"{pitcher_name} ({pitcher_hand}HP, ERA {pitcher_era:.2f}).\n\n"
+                f"El motor Monte Carlo generó el siguiente lineup óptimo:\n{lineup_text}\n\n"
+                f"Redacta un briefing táctico pre-partido en Markdown (máx 350 palabras) que explique:\n"
+                f"1. Por qué cada slot del orden de bateo está asignado a ese jugador\n"
+                f"2. Cómo el perfil de {pitcher_name} afecta las decisiones (mano, ERA, pitch mix estimado)\n"
+                f"3. Una alerta de platoon o sustitución de banca si aplica\n"
+                f"Sé conciso, usa negrita para nombres de jugadores y métricas clave."
+            )
+            msg = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return f"## Análisis Táctico — {away_name} @ {home_name}\n\n{msg.content[0].text}\n\n---\n*{source_note}*"
+        except Exception as exc:
+            logger.warning("claude_explanation_failed", error=str(exc))
+
+    # Rich template fallback (no API key)
+    top3 = sorted(lineup, key=lambda p: p.get("obp", 0), reverse=True)[:3]
+    power = sorted(lineup, key=lambda p: p.get("iso", 0), reverse=True)[:2]
+    lhb   = [p["name"].split()[-1] for p in lineup if p.get("hand") == "L"]
+    rhb   = [p["name"].split()[-1] for p in lineup if p.get("hand") == "R"]
+
+    platoon = ""
+    if pitcher_hand == "R" and lhb:
+        platoon = f"\n\n> ⚔️ **Ventaja de platoon:** {', '.join(lhb[:3])} (zurdos) tienen ventaja estadística vs {pitcher_hand}HP."
+    elif pitcher_hand == "L" and rhb:
+        platoon = f"\n\n> ⚔️ **Ventaja de platoon:** {', '.join(rhb[:3])} (diestros) tienen ventaja estadística vs {pitcher_hand}HP."
+
+    return (
+        f"## Análisis Táctico — {away_name} @ {home_name}\n\n"
+        f"**Lanzador rival:** {pitcher_name} ({pitcher_hand}HP) · ERA {pitcher_era:.2f}\n\n"
+        f"### Orden de Bateo — Lógica del Modelo\n\n"
+        f"El modelo optimizó el orden minimizando outs consecutivos y maximizando "
+        f"situaciones de runners en base para los bateadores de mayor potencia.\n\n"
+        f"**Generadores de base (OBP líderes):** "
+        f"{', '.join(f'**{p[\"name\"]}** ({p.get(\"obp\",0):.3f})' for p in top3)}\n\n"
+        f"**Bateadores de poder (ISO líderes):** "
+        f"{', '.join(f'**{p[\"name\"]}** (ISO {p.get(\"iso\",0):.3f})' for p in power)}"
+        f"{platoon}\n\n"
+        f"---\n*{source_note}*\n\n"
+        f"> 💡 Agrega `ANTHROPIC_API_KEY` al entorno para análisis táctico generado por IA."
+    )
+
+
 def _on_demand_optimize(game_pk: int) -> dict:
     """Fast on-demand optimization when Airflow hasn't written to DB yet."""
     from app.schemas import LineupOptimizeRequest, PlayerRosterEntry, RivalPitcherRequest
@@ -1404,6 +1480,11 @@ def _on_demand_optimize(game_pk: int) -> dict:
     bench  = [{k: v for k, v in pinfo.get(pid, _def(pid)).items() if k != "pitch_hand"}
               for pid in bench_ids if pid]
 
+    explanation = _generate_lineup_explanation(
+        lineup, pitcher_name, pitcher_hand, pitcher_era,
+        away_name, home_name, optimization_mode="on_demand_fast",
+    )
+
     return {
         "game_pk":           game_pk,
         "expected_runs":     round(result.expected_runs, 3),
@@ -1415,14 +1496,7 @@ def _on_demand_optimize(game_pk: int) -> dict:
         "elapsed_seconds":   round(result.elapsed_seconds, 1),
         "lineup":            lineup,
         "bench":             bench,
-        "rag_explanation": (
-            f"## Lineup Óptimo — {away_name} @ {home_name}\n\n"
-            f"**Predicción on-demand** (fast mode, 5k sims). "
-            f"La predicción definitiva llega via Airflow a T-2h.\n\n"
-            f"E[R] proyectado: **{result.expected_runs:.2f}** · "
-            f"P(Victoria): **{result.win_probability:.1%}**\n\n"
-            f"Lanzador rival: **{pitcher_name}** ({pitcher_hand}HP) · ERA {pitcher_era:.2f}"
-        ),
+        "rag_explanation":   explanation,
     }
 
 
@@ -1539,11 +1613,9 @@ async def get_optimize(game_pk: int) -> dict:
     bench = [{k: v for k, v in pinfo.get(pid, _default(pid)).items() if k != "pitch_hand"}
              for pid in bench_ids if pid]
 
-    rag = (
-        f"## Lineup Óptimo — {away_name} @ {home_name}\n\n"
-        f"Lineup generado por el motor Monte Carlo (Airflow). Fuente: `{lineup_source}`.\n\n"
-        f"E[R] proyectado: **{(ai_er or 0):.2f}** · P(Victoria): **{(win_prob or 0.5)*100:.1f}%**\n\n"
-        f"*(Explicación RAG completa disponible en los logs del DAG `mlb_gameday_orchestrator`.)*"
+    rag = _generate_lineup_explanation(
+        lineup, "Lanzador rival", "R", 4.00,
+        away_name, home_name, optimization_mode=lineup_source or "airflow",
     )
 
     return {

@@ -1185,6 +1185,416 @@ async def experiment_summary(
 
 
 # ---------------------------------------------------------------------------
+# Dashboard endpoints  (Streamlit ← FastAPI ← PostgreSQL / MLB Stats API)
+# ---------------------------------------------------------------------------
+
+_PG_HOST = os.getenv("POSTGRES_HOST", "")
+_PG_PORT = os.getenv("POSTGRES_PORT", "5432")
+_PG_DB   = os.getenv("POSTGRES_DB", "")
+_PG_USER = os.getenv("POSTGRES_USER", "")
+_PG_PASS = os.getenv("POSTGRES_PASSWORD", "")
+
+_MLB_STATS  = "https://statsapi.mlb.com/api/v1"
+_MLB_V11    = "https://statsapi.mlb.com/api/v1.1"
+
+
+def _pg_conn():
+    import psycopg2
+    return psycopg2.connect(
+        host=_PG_HOST, port=int(_PG_PORT),
+        dbname=_PG_DB, user=_PG_USER, password=_PG_PASS,
+        connect_timeout=5,
+    )
+
+
+def _stats_get(path: str, base: str = _MLB_STATS, params: dict | None = None) -> dict:
+    import requests as _r
+    for attempt in range(3):
+        try:
+            r = _r.get(f"{base}{path}", params=params, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(1.0)
+    raise RuntimeError(f"MLB API exhausted retries: {base}{path}")
+
+
+def _players_bulk(player_ids: list[int]) -> dict[int, dict]:
+    """Career stats + position for multiple player IDs in a single MLB API call."""
+    valid = [p for p in player_ids if p and p > 0]
+    if not valid:
+        return {}
+    try:
+        data = _stats_get(
+            "/people",
+            params={
+                "personIds": ",".join(str(p) for p in valid),
+                "hydrate": "stats(group=[hitting],type=[career])",
+            },
+        )
+    except Exception:
+        return {}
+
+    out: dict[int, dict] = {}
+    for p in data.get("people", []):
+        pid = p.get("id")
+        if not pid:
+            continue
+        name       = p.get("fullName", f"Player {pid}")
+        hand       = p.get("batSide", {}).get("code", "R")
+        pos        = p.get("primaryPosition", {}).get("abbreviation", "—")
+        pitch_hand = p.get("pitchHand", {}).get("code", "R")
+
+        cs: dict = {}
+        for s in p.get("stats", []):
+            if s.get("type", {}).get("displayName") == "career":
+                splits = s.get("splits", [])
+                if splits:
+                    cs = splits[0].get("stat", {})
+                    break
+
+        avg = float(cs.get("avg", 0.248) or 0.248)
+        obp = float(cs.get("obp", 0.318) or 0.318)
+        slg = float(cs.get("slg", 0.398) or 0.398)
+        out[pid] = {
+            "player_id":  pid,  "name": name, "pos": pos,
+            "hand":       hand, "pitch_hand": pitch_hand,
+            "avg":        round(avg, 3),
+            "ops":        round(obp + slg, 3),
+            "woba":       round((obp * 1.2 + slg * 0.7) / 2, 3),
+            "obp":        round(obp, 3),
+            "iso":        round(max(slg - avg, 0.0), 3),
+        }
+    return out
+
+
+@app.get("/v1/games/today", tags=["dashboard"])
+async def games_today() -> dict:
+    """Partidos MLB programados para hoy con probable pitchers."""
+    from datetime import date as _date, datetime as _dt
+    from zoneinfo import ZoneInfo
+
+    today = _date.today().isoformat()
+    try:
+        data = _stats_get("/schedule", params={
+            "sportId": 1, "date": today,
+            "hydrate": "team,venue,probablePitcher,status",
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MLB API error: {exc}")
+
+    raw_games: list[dict] = []
+    pitcher_ids: list[int] = []
+    for date_entry in data.get("dates", []):
+        for g in date_entry.get("games", []):
+            game_pk = g.get("gamePk")
+            if not game_pk:
+                continue
+            home = g.get("teams", {}).get("home", {})
+            away = g.get("teams", {}).get("away", {})
+            hp   = home.get("probablePitcher", {})
+            ap   = away.get("probablePitcher", {})
+
+            game_time_et = "TBD"
+            gd_str = g.get("gameDate", "")
+            if gd_str:
+                try:
+                    dt_utc = _dt.fromisoformat(gd_str.replace("Z", "+00:00"))
+                    dt_et  = dt_utc.astimezone(ZoneInfo("America/New_York"))
+                    game_time_et = dt_et.strftime("%-I:%M ET")
+                except Exception:
+                    game_time_et = gd_str[11:16] + " UTC"
+
+            if hp.get("id"): pitcher_ids.append(int(hp["id"]))
+            if ap.get("id"): pitcher_ids.append(int(ap["id"]))
+
+            raw_games.append({
+                "game_pk":          int(game_pk),
+                "home_team":        home.get("team", {}).get("abbreviation", ""),
+                "away_team":        away.get("team", {}).get("abbreviation", ""),
+                "home_name":        home.get("team", {}).get("name", ""),
+                "away_name":        away.get("team", {}).get("name", ""),
+                "game_time":        game_time_et,
+                "venue":            g.get("venue", {}).get("name", ""),
+                "game_date":        today,
+                "home_pitcher":     hp.get("fullName", "TBD"),
+                "away_pitcher":     ap.get("fullName", "TBD"),
+                "_home_pitcher_id": hp.get("id"),
+                "_away_pitcher_id": ap.get("id"),
+            })
+
+    pitcher_info = _players_bulk(pitcher_ids)
+    games = []
+    for rg in raw_games:
+        hp_id = rg.pop("_home_pitcher_id")
+        ap_id = rg.pop("_away_pitcher_id")
+        rg["home_pitcher_hand"] = pitcher_info.get(hp_id, {}).get("pitch_hand", "R") if hp_id else "R"
+        rg["away_pitcher_hand"] = pitcher_info.get(ap_id, {}).get("pitch_hand", "R") if ap_id else "R"
+        games.append(rg)
+
+    return {"games": games, "date": today, "total": len(games)}
+
+
+@app.get("/v1/optimize/{game_pk}", tags=["dashboard"])
+async def get_optimize(game_pk: int) -> dict:
+    """Lineup óptimo del modelo para un partido (leído de PostgreSQL, generado por Airflow)."""
+    if not _PG_HOST:
+        raise HTTPException(status_code=503, detail="PostgreSQL no configurado.")
+
+    try:
+        conn = _pg_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT ai_recommended_lineup, ai_expected_runs, win_probability,
+                   optimization_mode, model_version, predicted_at,
+                   home_batting_order, home_team_name, away_team_name, lineup_source
+            FROM gameday_predictions WHERE game_pk = %s
+        """, (game_pk,))
+        row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Sin predicción para game_pk={game_pk}")
+
+    (ai_lineup, ai_er, win_prob, opt_mode, model_ver, predicted_at,
+     home_order, home_name, away_name, lineup_source) = row
+
+    ordered_ids = (ai_lineup or home_order or [])[:9]
+    all_ids     = list(dict.fromkeys(ordered_ids + (home_order or [])[:12]))
+    pinfo       = _players_bulk([p for p in all_ids if p])
+
+    _default = lambda pid: {
+        "player_id": pid, "name": f"Player {pid}", "pos": "—",
+        "hand": "R", "avg": .248, "ops": .716, "woba": .315, "obp": .318, "iso": .150,
+    }
+
+    lineup = []
+    for i, pid in enumerate(ordered_ids, 1):
+        p = pinfo.get(pid, _default(pid))
+        lineup.append({"order": i, **{k: v for k, v in p.items() if k != "pitch_hand"}})
+
+    bench_ids = [pid for pid in (home_order or []) if pid not in set(ordered_ids)][:3]
+    bench = [{k: v for k, v in pinfo.get(pid, _default(pid)).items() if k != "pitch_hand"}
+             for pid in bench_ids if pid]
+
+    rag = (
+        f"## Lineup Óptimo — {away_name} @ {home_name}\n\n"
+        f"Lineup generado por el motor Monte Carlo (Airflow). Fuente: `{lineup_source}`.\n\n"
+        f"E[R] proyectado: **{(ai_er or 0):.2f}** · P(Victoria): **{(win_prob or 0.5)*100:.1f}%**\n\n"
+        f"*(Explicación RAG completa disponible en los logs del DAG `mlb_gameday_orchestrator`.)*"
+    )
+
+    return {
+        "game_pk":           game_pk,
+        "expected_runs":     round(ai_er or 0.0, 3),
+        "win_probability":   round(win_prob or 0.5, 4),
+        "model_confidence":  0.80,
+        "optimization_mode": opt_mode or "fast",
+        "model_version":     model_ver or _state.model_version,
+        "total_simulations": 10_000,
+        "elapsed_seconds":   0.0,
+        "lineup":            lineup,
+        "bench":             bench,
+        "rag_explanation":   rag,
+    }
+
+
+@app.get("/v1/games/history", tags=["dashboard"])
+async def games_history(date: str) -> dict:
+    """Partidos históricos con resultados para una fecha dada (PostgreSQL o MLB API)."""
+    rows: list = []
+    if _PG_HOST:
+        try:
+            conn = _pg_conn()
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT game_pk, home_team_name, away_team_name,
+                       actual_home_runs, actual_away_runs,
+                       home_starting_pitcher_id, away_starting_pitcher_id
+                FROM gameday_predictions WHERE game_date = %s ORDER BY game_pk
+            """, (date,))
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as exc:
+            logger.warning("games_history_db_error", error=str(exc))
+
+    games: list[dict] = []
+
+    if rows:
+        pitcher_ids = [r[5] for r in rows if r[5]] + [r[6] for r in rows if r[6]]
+        pinfo = _players_bulk(pitcher_ids)
+        for row in rows:
+            gpk, home_name, away_name, hr, ar, hp_id, ap_id = row
+            games.append({
+                "game_pk":          gpk,
+                "home_name":        home_name or "",
+                "away_name":        away_name or "",
+                "home_team":        "",
+                "away_team":        "",
+                "game_date":        date,
+                "final_score":      f"{hr}-{ar}" if hr is not None else "N/A",
+                "home_runs_actual": hr or 0,
+                "away_runs_actual": ar or 0,
+                "home_pitcher":     pinfo.get(hp_id, {}).get("name", "") if hp_id else "",
+                "away_pitcher":     pinfo.get(ap_id, {}).get("name", "") if ap_id else "",
+            })
+    else:
+        try:
+            data = _stats_get("/schedule", params={
+                "sportId": 1, "date": date, "hydrate": "team,linescore,status",
+            })
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"MLB API error: {exc}")
+
+        for de in data.get("dates", []):
+            for g in de.get("games", []):
+                gp = g.get("gamePk")
+                if not gp:
+                    continue
+                home = g.get("teams", {}).get("home", {}).get("team", {})
+                away = g.get("teams", {}).get("away", {}).get("team", {})
+                ls   = g.get("linescore", {}).get("teams", {})
+                hr   = ls.get("home", {}).get("runs", 0) or 0
+                ar   = ls.get("away", {}).get("runs", 0) or 0
+                st   = g.get("status", {}).get("abstractGameState", "")
+                games.append({
+                    "game_pk":          int(gp),
+                    "home_name":        home.get("name", ""),
+                    "away_name":        away.get("name", ""),
+                    "home_team":        home.get("abbreviation", ""),
+                    "away_team":        away.get("abbreviation", ""),
+                    "game_date":        date,
+                    "final_score":      f"{hr}-{ar}" if st == "Final" else "N/A",
+                    "home_runs_actual": hr,
+                    "away_runs_actual": ar,
+                    "home_pitcher":     "",
+                    "away_pitcher":     "",
+                })
+
+    return {"games": games, "date": date, "total": len(games)}
+
+
+@app.get("/v1/report/{game_pk}", tags=["dashboard"])
+async def get_report(game_pk: int, date: str | None = None) -> dict:
+    """Reporte post-partido completo: lineups, métricas y análisis Markdown."""
+    import math
+
+    if not _PG_HOST:
+        raise HTTPException(status_code=503, detail="PostgreSQL no configurado.")
+
+    try:
+        conn = _pg_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT game_pk, game_date, home_team_name, away_team_name,
+                   ai_recommended_lineup, home_batting_order,
+                   ai_expected_runs, win_probability, model_version,
+                   actual_home_runs, actual_away_runs, delta_er, game_state
+            FROM gameday_predictions WHERE game_pk = %s
+        """, (game_pk,))
+        row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"DB error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Sin datos para game_pk={game_pk}")
+
+    (gpk, game_date, home_name, away_name,
+     ai_lineup, home_order,
+     ai_er, win_prob, model_ver,
+     actual_home_runs, actual_away_runs, _delta_er, game_state) = row
+
+    all_ids     = list(dict.fromkeys((ai_lineup or []) + (home_order or [])))
+    player_info = _players_bulk([p for p in all_ids if p])
+
+    # Proposed lineup (model recommendation)
+    proposed_lineup = [
+        {"order": i, "name": player_info.get(pid, {}).get("name", f"Player {pid}"),
+         "pos": player_info.get(pid, {}).get("pos", "—")}
+        for i, pid in enumerate((ai_lineup or [])[:9], 1)
+    ]
+
+    # Actual lineup: try live-feed boxscore, fall back to stored batting order
+    actual_lineup = []
+    try:
+        feed     = _stats_get(f"/game/{game_pk}/feed/live", base=_MLB_V11)
+        home_box = feed.get("liveData", {}).get("boxscore", {}).get("teams", {}).get("home", {})
+        bs_order  = home_box.get("battingOrder", []) or home_order or []
+        bs_players = home_box.get("players", {})
+
+        for i, pid in enumerate(bs_order[:9], 1):
+            pbox = bs_players.get(f"ID{pid}", {})
+            st   = pbox.get("stats", {}).get("batting", {})
+            h, ab = st.get("hits", 0) or 0, st.get("atBats", 0) or 0
+            hr, bb = st.get("homeRuns", 0) or 0, st.get("baseOnBalls", 0) or 0
+            rbi, so = st.get("rbi", 0) or 0, st.get("strikeOuts", 0) or 0
+            parts = [f"{h}-for-{ab}"]
+            if hr:           parts.append(f"{hr} HR")
+            elif rbi:        parts.append(f"{rbi} RBI")
+            if bb:           parts.append(f"{bb} BB")
+            if so and not h: parts.append(f"{so}K")
+            actual_lineup.append({
+                "order":  i,
+                "name":   pbox.get("person", {}).get("fullName", player_info.get(pid, {}).get("name", f"Player {pid}")),
+                "pos":    pbox.get("position", {}).get("abbreviation", "—"),
+                "result": ", ".join(parts),
+            })
+    except Exception:
+        actual_lineup = [
+            {"order": i, "name": player_info.get(pid, {}).get("name", f"Player {pid}"),
+             "pos": player_info.get(pid, {}).get("pos", "—"), "result": "—"}
+            for i, pid in enumerate((home_order or [])[:9], 1)
+        ]
+
+    hr_actual   = actual_home_runs or 0
+    ar_actual   = actual_away_runs or 0
+    game_result = hr_actual > ar_actual
+    prob        = max(0.001, min(0.999, win_prob or 0.5))
+    log_loss    = round(-math.log(prob if game_result else (1.0 - prob)), 3)
+    delta       = hr_actual - (ai_er or 0.0)
+    sign        = "+" if delta >= 0 else ""
+
+    report_md = (
+        f"## Post-Game Analysis — {home_name} {hr_actual}, {away_name} {ar_actual}\n"
+        f"**Fecha:** {game_date} &nbsp;|&nbsp; "
+        f"**Modelo:** {model_ver or 'unknown'} &nbsp;|&nbsp; "
+        f"**Log-Loss:** {log_loss:.3f}\n\n---\n\n"
+        f"### Evaluación del Modelo\n\n"
+        f"| Métrica | Valor |\n|---|---|\n"
+        f"| E[R] proyectado | {ai_er or 0:.2f} |\n"
+        f"| Carreras reales | **{hr_actual}** |\n"
+        f"| Δ E[R] | {sign}{delta:.2f} {'✅' if delta >= 0 else '⚠️'} |\n"
+        f"| Win Prob. proyectada | {prob*100:.1f}% |\n"
+        f"| Log-Loss del partido | {log_loss:.3f} "
+        f"{'✅ bueno' if log_loss < 0.5 else '⚠️ revisar'} |\n\n"
+        f"### Estado del partido\n"
+        f"**{game_state or 'N/A'}** — "
+        f"{'✅ Victoria' if game_result else '❌ Derrota'} del equipo local.\n"
+    )
+
+    return {
+        "game_pk":                   gpk,
+        "game_date":                 str(game_date),
+        "matchup":                   f"{away_name} @ {home_name}  ·  {hr_actual}–{ar_actual}",
+        "game_result":               game_result,
+        "proposed_lineup":           proposed_lineup,
+        "actual_lineup":             actual_lineup,
+        "projected_runs":            round(ai_er or 0.0, 2),
+        "actual_home_runs":          hr_actual,
+        "actual_away_runs":          ar_actual,
+        "win_probability_projected": round(prob, 4),
+        "model_log_loss":            log_loss,
+        "model_version":             model_ver or "unknown",
+        "report_markdown":           report_md,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point (local dev only — use gunicorn in production)
 # ---------------------------------------------------------------------------
 

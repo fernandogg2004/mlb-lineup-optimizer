@@ -107,6 +107,7 @@ services:
       FEEDBACK_STORE_PATH: /opt/app-data/gold/qualitative_feedback
       EXPERIMENT_STORE_PATH: /opt/app-data/gold/ab_experiment
       MLFLOW_TRACKING_URI: /opt/mlruns
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       PORT: '8000'
       # PostgreSQL — dashboard read endpoints
       POSTGRES_HOST: postgres-mlb

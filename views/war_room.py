@@ -34,6 +34,7 @@ def _init_state() -> None:
         "what_if_delta":     None,
         "whatsif_result":    None,
         "wr_game_pk":        None,
+        "wr_team":           "home",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -209,8 +210,21 @@ def render_war_room() -> None:
     sel_game = game_map[sel_label]
     game_pk  = sel_game["game_pk"]
 
-    if st.session_state["wr_game_pk"] != game_pk:
+    team_sel = st.radio(
+        "Equipo a optimizar",
+        ["home", "away"],
+        format_func=lambda t: (
+            f"🏠 {sel_game['home_name']} (Local)"
+            if t == "home"
+            else f"✈️ {sel_game['away_name']} (Visitante)"
+        ),
+        horizontal=True,
+        key="wr_team_sel",
+    )
+
+    if st.session_state["wr_game_pk"] != game_pk or st.session_state["wr_team"] != team_sel:
         st.session_state["wr_game_pk"]     = game_pk
+        st.session_state["wr_team"]        = team_sel
         st.session_state["whatsif_result"] = None
 
     # Pitcher banner
@@ -229,8 +243,9 @@ def render_war_room() -> None:
     st.divider()
 
     # ── Lineup data ────────────────────────────────────────────────────────────
-    with st.spinner("Generando lineup óptimo… (primera carga ~50s si Airflow aún no corrió)"):
-        data = get_game_lineup(game_pk)
+    team_label = sel_game['home_name'] if team_sel == "home" else sel_game['away_name']
+    with st.spinner(f"Generando lineup óptimo para {team_label}… (~50s si Airflow aún no corrió)"):
+        data = get_game_lineup(game_pk, team=team_sel)
 
     # ── KPI Cards ──────────────────────────────────────────────────────────────
     k1, k2, k3, k4 = st.columns(4)

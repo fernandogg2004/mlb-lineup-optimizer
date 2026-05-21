@@ -1364,6 +1364,9 @@ def _generate_lineup_explanation(
     lhb   = [p["name"].split()[-1] for p in lineup if p.get("hand") == "L"]
     rhb   = [p["name"].split()[-1] for p in lineup if p.get("hand") == "R"]
 
+    top3_str  = ", ".join(f"**{p['name']}** ({p.get('obp', 0):.3f})" for p in top3)
+    power_str = ", ".join(f"**{p['name']}** (ISO {p.get('iso', 0):.3f})" for p in power)
+
     platoon = ""
     if pitcher_hand == "R" and lhb:
         platoon = f"\n\n> ⚔️ **Ventaja de platoon:** {', '.join(lhb[:3])} (zurdos) tienen ventaja estadística vs {pitcher_hand}HP."
@@ -1376,18 +1379,20 @@ def _generate_lineup_explanation(
         f"### Orden de Bateo — Lógica del Modelo\n\n"
         f"El modelo optimizó el orden minimizando outs consecutivos y maximizando "
         f"situaciones de runners en base para los bateadores de mayor potencia.\n\n"
-        f"**Generadores de base (OBP líderes):** "
-        f"{', '.join(f'**{p[\"name\"]}** ({p.get(\"obp\",0):.3f})' for p in top3)}\n\n"
-        f"**Bateadores de poder (ISO líderes):** "
-        f"{', '.join(f'**{p[\"name\"]}** (ISO {p.get(\"iso\",0):.3f})' for p in power)}"
+        f"**Generadores de base (OBP líderes):** {top3_str}\n\n"
+        f"**Bateadores de poder (ISO líderes):** {power_str}"
         f"{platoon}\n\n"
         f"---\n*{source_note}*\n\n"
         f"> 💡 Agrega `GROQ_API_KEY` (gratis en console.groq.com) para análisis táctico generado por IA."
     )
 
 
-def _on_demand_optimize(game_pk: int) -> dict:
-    """Fast on-demand optimization when Airflow hasn't written to DB yet."""
+def _on_demand_optimize(game_pk: int, team: str = "home") -> dict:
+    """Fast on-demand optimization when Airflow hasn't written to DB yet.
+
+    `team` controls which side to optimize: "home" (default) or "away".
+    The rival pitcher is always the opponent's probable starter.
+    """
     from app.schemas import LineupOptimizeRequest, PlayerRosterEntry, RivalPitcherRequest
 
     # 1. Fetch game from MLB API
@@ -1409,15 +1414,23 @@ def _on_demand_optimize(game_pk: int) -> dict:
     away         = game_info["teams"]["away"]
     home_team_id = home["team"]["id"]
     home_name    = home["team"]["name"]
+    away_team_id = away["team"]["id"]
     away_name    = away["team"]["name"]
-    away_pp      = away.get("probablePitcher", {})
-    away_pid     = away_pp.get("id")
+
+    # Select batting team and opponent pitcher based on `team` param
+    if team == "away":
+        batting_team_id = away_team_id
+        opp_pp  = home.get("probablePitcher", {})
+    else:
+        batting_team_id = home_team_id
+        opp_pp  = away.get("probablePitcher", {})
+    opp_pid = opp_pp.get("id")
 
     # 2. Build projected batting order from 40-Man roster
     pos_priority = {"DH": 0, "RF": 1, "LF": 2, "CF": 3,
                     "1B": 4, "3B": 5, "SS": 6, "2B": 7, "C": 8}
     roster_raw = _stats_get(
-        f"/teams/{home_team_id}/roster/40Man",
+        f"/teams/{batting_team_id}/roster/40Man",
         params={"hydrate": "person(stats(type=career,group=hitting))"},
     ).get("roster", [])
 
@@ -1457,11 +1470,11 @@ def _on_demand_optimize(game_pk: int) -> dict:
                       for b in batters[:9]]
 
     # 3. Pitcher info
-    pitcher_name = away_pp.get("fullName", f"Pitcher {away_pid}")
+    pitcher_name = opp_pp.get("fullName", f"Pitcher {opp_pid}")
     pitcher_hand, pitcher_era = "R", 4.00
-    if away_pid:
+    if opp_pid:
         try:
-            pdata = _stats_get(f"/people/{away_pid}",
+            pdata = _stats_get(f"/people/{opp_pid}",
                                params={"hydrate": "stats(group=[pitching],type=[season])"})
             pp = (pdata.get("people") or [{}])[0]
             pitcher_name = pp.get("fullName", pitcher_name)
@@ -1481,7 +1494,7 @@ def _on_demand_optimize(game_pk: int) -> dict:
     req = LineupOptimizeRequest(
         roster=[PlayerRosterEntry(**p) for p in roster_entries],
         rival_pitcher=RivalPitcherRequest(
-            pitcher_id=int(away_pid) if away_pid else 0,
+            pitcher_id=int(opp_pid) if opp_pid else 0,
             pitcher_name=pitcher_name,
             hand=pitcher_hand,
             era=pitcher_era,
@@ -1510,14 +1523,16 @@ def _on_demand_optimize(game_pk: int) -> dict:
         away_name, home_name, optimization_mode="on_demand_fast",
     )
 
+    sim_count = 100_000 if result.optimization_mode == "full" else 5_000
     return {
         "game_pk":           game_pk,
+        "team":              team,
         "expected_runs":     round(result.expected_runs, 3),
         "win_probability":   round(result.win_probability, 4),
         "model_confidence":  0.65,
         "optimization_mode": "on_demand_fast",
         "model_version":     _state.model_version,
-        "total_simulations": 5_000,
+        "total_simulations": sim_count,
         "elapsed_seconds":   round(result.elapsed_seconds, 1),
         "lineup":            lineup,
         "bench":             bench,
@@ -1593,8 +1608,18 @@ async def games_today() -> dict:
 
 
 @app.get("/v1/optimize/{game_pk}", tags=["dashboard"])
-async def get_optimize(game_pk: int) -> dict:
-    """Lineup óptimo del modelo para un partido (leído de PostgreSQL, generado por Airflow)."""
+async def get_optimize(game_pk: int, team: str = "home") -> dict:
+    """Lineup óptimo del modelo para un partido.
+
+    `team` query param selects which side to optimize: "home" (default) or "away".
+    The DB only stores home-team predictions from Airflow; away always uses on-demand.
+    """
+    loop = asyncio.get_event_loop()
+
+    # Away team: DB has no away-side predictions — go straight to on-demand
+    if team == "away":
+        return await loop.run_in_executor(None, _on_demand_optimize, game_pk, "away")
+
     if not _PG_HOST:
         raise HTTPException(status_code=503, detail="PostgreSQL no configurado.")
 
@@ -1614,8 +1639,7 @@ async def get_optimize(game_pk: int) -> dict:
 
     if not row:
         # Airflow hasn't written a prediction yet — run fast on-demand optimization
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _on_demand_optimize, game_pk)
+        return await loop.run_in_executor(None, _on_demand_optimize, game_pk, "home")
 
     (ai_lineup, ai_er, win_prob, opt_mode, model_ver, predicted_at,
      home_order, home_name, away_name, lineup_source) = row
@@ -1661,8 +1685,45 @@ async def get_optimize(game_pk: int) -> dict:
 @app.get("/v1/games/history", tags=["dashboard"])
 async def games_history(date: str) -> dict:
     """Partidos históricos con resultados para una fecha dada (PostgreSQL o MLB API)."""
-    rows: list = []
-    if _PG_HOST:
+    # Always fetch the full game list from MLB API so all games appear regardless
+    # of how many DB predictions Airflow has written for that date.
+    try:
+        data = _stats_get("/schedule", params={
+            "sportId": 1, "date": date, "hydrate": "team,linescore,status",
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MLB API error: {exc}")
+
+    games: list[dict] = []
+    for de in data.get("dates", []):
+        for g in de.get("games", []):
+            gp = g.get("gamePk")
+            if not gp:
+                continue
+            home = g.get("teams", {}).get("home", {}).get("team", {})
+            away = g.get("teams", {}).get("away", {}).get("team", {})
+            ls   = g.get("linescore", {}).get("teams", {})
+            hr   = ls.get("home", {}).get("runs", 0) or 0
+            ar   = ls.get("away", {}).get("runs", 0) or 0
+            st   = g.get("status", {}).get("abstractGameState", "")
+            games.append({
+                "game_pk":          int(gp),
+                "home_name":        home.get("name", ""),
+                "away_name":        away.get("name", ""),
+                "home_team":        home.get("abbreviation", ""),
+                "away_team":        away.get("abbreviation", ""),
+                "game_date":        date,
+                "final_score":      f"{hr}-{ar}" if st == "Final" else "N/A",
+                "home_runs_actual": hr,
+                "away_runs_actual": ar,
+                "home_pitcher":     "",
+                "away_pitcher":     "",
+            })
+
+    # Enrich with DB pitcher data where available without restricting the list.
+    # Previously the endpoint returned ONLY DB rows when any existed, causing
+    # all games without a DB prediction to disappear from the UI.
+    if _PG_HOST and games:
         try:
             conn = _pg_conn()
             cur  = conn.cursor()
@@ -1670,65 +1731,28 @@ async def games_history(date: str) -> dict:
                 SELECT game_pk, home_team_name, away_team_name,
                        actual_home_runs, actual_away_runs,
                        home_starting_pitcher_id, away_starting_pitcher_id
-                FROM gameday_predictions WHERE game_date = %s ORDER BY game_pk
+                FROM gameday_predictions WHERE game_date = %s
             """, (date,))
-            rows = cur.fetchall()
+            db_rows = {r[0]: r for r in cur.fetchall()}
             conn.close()
+
+            pitcher_ids = [r[5] for r in db_rows.values() if r[5]] + \
+                          [r[6] for r in db_rows.values() if r[6]]
+            pinfo = _players_bulk(pitcher_ids) if pitcher_ids else {}
+
+            for game in games:
+                row = db_rows.get(game["game_pk"])
+                if row:
+                    _, home_name, away_name, db_hr, db_ar, hp_id, ap_id = row
+                    # Prefer DB run totals when Airflow stored them
+                    if db_hr is not None:
+                        game["home_runs_actual"] = db_hr
+                        game["away_runs_actual"] = db_ar or 0
+                        game["final_score"] = f"{db_hr}-{db_ar or 0}"
+                    game["home_pitcher"] = pinfo.get(hp_id, {}).get("name", "") if hp_id else ""
+                    game["away_pitcher"] = pinfo.get(ap_id, {}).get("name", "") if ap_id else ""
         except Exception as exc:
             logger.warning("games_history_db_error", error=str(exc))
-
-    games: list[dict] = []
-
-    if rows:
-        pitcher_ids = [r[5] for r in rows if r[5]] + [r[6] for r in rows if r[6]]
-        pinfo = _players_bulk(pitcher_ids)
-        for row in rows:
-            gpk, home_name, away_name, hr, ar, hp_id, ap_id = row
-            games.append({
-                "game_pk":          gpk,
-                "home_name":        home_name or "",
-                "away_name":        away_name or "",
-                "home_team":        "",
-                "away_team":        "",
-                "game_date":        date,
-                "final_score":      f"{hr}-{ar}" if hr is not None else "N/A",
-                "home_runs_actual": hr or 0,
-                "away_runs_actual": ar or 0,
-                "home_pitcher":     pinfo.get(hp_id, {}).get("name", "") if hp_id else "",
-                "away_pitcher":     pinfo.get(ap_id, {}).get("name", "") if ap_id else "",
-            })
-    else:
-        try:
-            data = _stats_get("/schedule", params={
-                "sportId": 1, "date": date, "hydrate": "team,linescore,status",
-            })
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"MLB API error: {exc}")
-
-        for de in data.get("dates", []):
-            for g in de.get("games", []):
-                gp = g.get("gamePk")
-                if not gp:
-                    continue
-                home = g.get("teams", {}).get("home", {}).get("team", {})
-                away = g.get("teams", {}).get("away", {}).get("team", {})
-                ls   = g.get("linescore", {}).get("teams", {})
-                hr   = ls.get("home", {}).get("runs", 0) or 0
-                ar   = ls.get("away", {}).get("runs", 0) or 0
-                st   = g.get("status", {}).get("abstractGameState", "")
-                games.append({
-                    "game_pk":          int(gp),
-                    "home_name":        home.get("name", ""),
-                    "away_name":        away.get("name", ""),
-                    "home_team":        home.get("abbreviation", ""),
-                    "away_team":        away.get("abbreviation", ""),
-                    "game_date":        date,
-                    "final_score":      f"{hr}-{ar}" if st == "Final" else "N/A",
-                    "home_runs_actual": hr,
-                    "away_runs_actual": ar,
-                    "home_pitcher":     "",
-                    "away_pitcher":     "",
-                })
 
     return {"games": games, "date": date, "total": len(games)}
 

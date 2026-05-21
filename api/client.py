@@ -160,20 +160,27 @@ def get_todays_games() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_game_lineup(game_pk: int) -> dict:
+def get_game_lineup(game_pk: int, team: str = "home") -> dict:
     """
     Lineup óptimo + métricas + explicación RAG.
 
+    `team`: "home" (default) or "away" — selects which side to optimize.
+
     REAL API CALL:
         import httpx
-        r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", timeout=120)
+        r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", params={"team": team}, timeout=120)
         r.raise_for_status()
         return r.json()
     """
     if not DEMO_MODE:
         try:
             import httpx
-            r = httpx.get(f"{API_BASE}/v1/optimize/{game_pk}", headers=_auth_headers(), timeout=120)
+            r = httpx.get(
+                f"{API_BASE}/v1/optimize/{game_pk}",
+                params={"team": team},
+                headers=_auth_headers(),
+                timeout=120,
+            )
             r.raise_for_status()
             return r.json()
         except Exception as exc:

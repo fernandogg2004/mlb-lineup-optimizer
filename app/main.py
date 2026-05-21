@@ -1781,7 +1781,68 @@ async def get_report(game_pk: int, date: str | None = None) -> dict:
         raise HTTPException(status_code=503, detail=f"DB error: {exc}")
 
     if not row:
-        raise HTTPException(status_code=404, detail=f"Sin datos para game_pk={game_pk}")
+        # No DB prediction — build a basic report from MLB live feed
+        try:
+            feed      = _stats_get(f"/game/{game_pk}/feed/live", base=_MLB_V11)
+            gdata     = feed.get("gameData", {})
+            home_info = gdata.get("teams", {}).get("home", {})
+            away_info = gdata.get("teams", {}).get("away", {})
+            home_name = home_info.get("name", "Home")
+            away_name = away_info.get("name", "Away")
+            gdate     = gdata.get("datetime", {}).get("officialDate", date or "")
+            ldata     = feed.get("liveData", {})
+            ls_teams  = ldata.get("linescore", {}).get("teams", {})
+            hr_actual = ls_teams.get("home", {}).get("runs", 0) or 0
+            ar_actual = ls_teams.get("away", {}).get("runs", 0) or 0
+            home_box  = ldata.get("boxscore", {}).get("teams", {}).get("home", {})
+            bs_order  = home_box.get("battingOrder", [])
+            bs_players = home_box.get("players", {})
+            actual_lineup = []
+            for i, pid in enumerate(bs_order[:9], 1):
+                pbox = bs_players.get(f"ID{pid}", {})
+                st   = pbox.get("stats", {}).get("batting", {})
+                h, ab  = st.get("hits", 0) or 0, st.get("atBats", 0) or 0
+                hr_s, bb = st.get("homeRuns", 0) or 0, st.get("baseOnBalls", 0) or 0
+                rbi, so  = st.get("rbi", 0) or 0, st.get("strikeOuts", 0) or 0
+                parts = [f"{h}-for-{ab}"]
+                if hr_s:          parts.append(f"{hr_s} HR")
+                elif rbi:         parts.append(f"{rbi} RBI")
+                if bb:            parts.append(f"{bb} BB")
+                if so and not h:  parts.append(f"{so}K")
+                actual_lineup.append({
+                    "order":  i,
+                    "name":   pbox.get("person", {}).get("fullName", f"Player {pid}"),
+                    "pos":    pbox.get("position", {}).get("abbreviation", "—"),
+                    "result": ", ".join(parts),
+                })
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=f"Sin datos para game_pk={game_pk}: {exc}")
+
+        game_result = hr_actual > ar_actual
+        report_md = (
+            f"## Post-Game Analysis — {home_name} {hr_actual}, {away_name} {ar_actual}\n"
+            f"**Fecha:** {gdate}\n\n"
+            f"> ℹ️ Este partido no fue procesado por Airflow — no hay predicción de modelo disponible.\n\n"
+            f"---\n\n"
+            f"### Resultado\n"
+            f"{'✅ Victoria' if game_result else '❌ Derrota'} del equipo local "
+            f"({home_name} **{hr_actual}**, {away_name} **{ar_actual}**)\n"
+        )
+        return {
+            "game_pk":                   game_pk,
+            "game_date":                 gdate,
+            "matchup":                   f"{away_name} @ {home_name}  ·  {hr_actual}–{ar_actual}",
+            "game_result":               game_result,
+            "proposed_lineup":           [],
+            "actual_lineup":             actual_lineup,
+            "projected_runs":            0.0,
+            "actual_home_runs":          hr_actual,
+            "actual_away_runs":          ar_actual,
+            "win_probability_projected": 0.5,
+            "model_log_loss":            0.0,
+            "model_version":             "N/A",
+            "report_markdown":           report_md,
+        }
 
     (gpk, game_date, home_name, away_name,
      ai_lineup, home_order,

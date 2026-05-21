@@ -133,49 +133,78 @@ def render_post_game() -> None:
 
     # ── Lineup comparison ──────────────────────────────────────────────────────
     st.markdown("### Lineup Propuesto vs. Lineup Utilizado")
-    _lineup_comparison(report)
+    if report.get("proposed_lineup"):
+        _lineup_comparison(report)
+    else:
+        st.info(
+            "Este partido no fue procesado por Airflow — no hay predicción de modelo disponible. "
+            "Se muestra únicamente el lineup real.",
+            icon="ℹ️",
+        )
+        if report.get("actual_lineup"):
+            rows_a = [
+                {"#": p["order"], "Jugador": p["name"], "Pos": p["pos"],
+                 "Resultado": p.get("result", "—")}
+                for p in report["actual_lineup"]
+            ]
+            st.dataframe(
+                pd.DataFrame(rows_a).set_index("#"),
+                use_container_width=True, height=360,
+            )
 
     st.divider()
 
     # ── E[R] chart + stats ─────────────────────────────────────────────────────
-    st.markdown("### E[R] Proyectado vs. Carreras Reales")
+    has_prediction = bool(report.get("proposed_lineup"))
+
+    if has_prediction:
+        st.markdown("### E[R] Proyectado vs. Carreras Reales")
+    else:
+        st.markdown("### Resultado del partido")
 
     chart_c, stats_c = st.columns([3, 2], gap="large")
 
     with chart_c:
-        st.plotly_chart(
-            er_comparison_chart(
-                projected=report["projected_runs"],
-                actual=report["actual_home_runs"],
-                matchup=report["matchup"],
-            ),
-            width="stretch",
-            config={"displayModeBar": False},
-            key="pg_er_chart",
-        )
+        if has_prediction:
+            st.plotly_chart(
+                er_comparison_chart(
+                    projected=report["projected_runs"],
+                    actual=report["actual_home_runs"],
+                    matchup=report["matchup"],
+                ),
+                width="stretch",
+                config={"displayModeBar": False},
+                key="pg_er_chart",
+            )
+        else:
+            st.markdown(
+                f"<div style='background:#0d1528; border:1px solid #1e2d4a; border-radius:10px;"
+                f"padding:30px; text-align:center; font-size:1.4rem; color:#b0bec5;'>"
+                f"🏟️ {report['matchup']}</div>",
+                unsafe_allow_html=True,
+            )
 
     with stats_c:
-        delta_er = report["actual_home_runs"] - report["projected_runs"]
-        is_win   = report["game_result"]
+        is_win = report["game_result"]
 
         st.markdown("#### Resumen")
-        st.metric("E[R] Proyectado",     f"{report['projected_runs']:.2f}")
-        st.metric(
-            "Carreras Reales",
-            str(report["actual_home_runs"]),
-            delta=f"{'+' if delta_er >= 0 else ''}{delta_er:.2f} vs proyección",
-            delta_color="normal",
-        )
-        st.metric(
-            "Win Prob. Proyectada",
-            f"{report['win_probability_projected']*100:.1f}%",
-        )
-        st.metric(
-            "Log-Loss Partido",
-            f"{report['model_log_loss']:.3f}",
-            delta="bueno (< 0.5)" if report["model_log_loss"] < 0.5 else "revisar (≥ 0.5)",
-            delta_color="inverse",
-        )
+        st.metric("Carreras equipo local",  str(report["actual_home_runs"]))
+        st.metric("Carreras equipo visitante", str(report["actual_away_runs"]))
+        if has_prediction:
+            delta_er = report["actual_home_runs"] - report["projected_runs"]
+            st.metric("E[R] Proyectado", f"{report['projected_runs']:.2f}",
+                      delta=f"{'+' if delta_er >= 0 else ''}{delta_er:.2f} vs real",
+                      delta_color="normal")
+            st.metric(
+                "Win Prob. Proyectada",
+                f"{report['win_probability_projected']*100:.1f}%",
+            )
+            st.metric(
+                "Log-Loss Partido",
+                f"{report['model_log_loss']:.3f}",
+                delta="bueno (< 0.5)" if report["model_log_loss"] < 0.5 else "revisar (≥ 0.5)",
+                delta_color="inverse",
+            )
 
         res_text = "✅ Victoria" if is_win else "❌ Derrota"
         res_css  = "alert-positive" if is_win else "alert-negative"

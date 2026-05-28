@@ -1,0 +1,75 @@
+# =============================================================================
+# MLB Lineup Optimizer — Dependencias para uso LOCAL (sin Docker ni Airflow)
+# Requiere Python 3.11 o 3.12 — NO compatible con Python 3.13+
+# =============================================================================
+# IMPORTANTE: activar el venv antes de instalar:
+#   .venv\Scripts\activate          (Windows)
+#   source .venv/bin/activate       (Linux/Mac)
+#
+# Luego instalar:
+#   pip install -r requirements_local.txt
+
+# --- HTTP API framework ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+
+# --- HTTP client (API calls) ---
+plotly==5.22.0
+httpx[http2]==0.28.1
+
+# --- ML inference (pinados: el modelo fue entrenado con estas versiones) ---
+numpy==1.26.4
+lightgbm==4.3.0
+numba==0.59.1
+scikit-learn==1.5.2
+scipy==1.17.1
+
+# --- Data ---
+polars==0.20.31          # pinado: columnas de features dependen de esta versión
+pandas>=2.2.2
+pyarrow>=15.0.2          # no bajar de 15; subir está bien
+pybaseball==2.2.7
+
+# --- Optimizer / Simulation ---
+deap==1.4.1
+ray==2.20.0
+
+# --- LLM / RAG (War Room tactical explanations) ---
+anthropic==0.103.0
+llama-index-core==0.14.22
+llama-index-llms-anthropic==0.11.4
+tiktoken==0.13.0
+
+# --- Model registry (local filesystem backend) ---
+mlflow==2.13.2
+
+# --- Schema / validation ---
+pydantic==2.13.4
+
+# --- Observability ---
+structlog==24.1.0
+python-json-logger==2.0.7
+prometheus-client==0.25.0
+
+# --- Configuration ---
+python-dotenv==1.0.1
+pyyaml==6.0.3
+
+# --- HTTP client ---
+requests>=2.32.3
+tenacity>=8.1.0,<9
+
+# --- Weather ---
+meteostat==1.6.8
+
+# --- Scheduling ---
+apscheduler==3.10.4
+
+# --- PostgreSQL (opcional: solo si usas DB local) ---
+psycopg2-binary==2.9.9
+
+# --- Testing ---
+pytest==8.2.2
+pytest-asyncio==0.23.7
+pytest-cov==5.0.0

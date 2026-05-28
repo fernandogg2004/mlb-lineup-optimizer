@@ -1,0 +1,132 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: #0A0E1A;
+  color: #E8EAF6;
+  font-family: 'Inter', sans-serif;
+  margin: 0;
+  min-height: 100vh;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+@keyframes pulse-live {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.animate-live {
+  animation: pulse-live 2s ease-in-out infinite;
+}
+
+@keyframes flash-green {
+  0% { background-color: rgba(0, 255, 135, 0.10); }
+  100% { background-color: transparent; }
+}
+
+.animate-flash {
+  animation: flash-green 400ms ease-out forwards;
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-card {
+  animation: fade-in-up 0.3s ease-out both;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #111827;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #4B5563;
+}
+
+/* Select styling */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 0.5rem center;
+  background-size: 1.25em 1.25em;
+  padding-right: 2rem;
+}
+
+/* ── Responsive / Tablet layout (Transversal roadmap item) ──────────────── */
+
+/* Stack KPI grid to 1-col on small screens */
+@media (max-width: 768px) {
+  .grid.grid-cols-3 {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Stack 2-col layouts to single column on mobile */
+  .grid[style*="3fr 2fr"],
+  .grid[style*="gridTemplateColumns"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Larger tap targets for buttons on touch */
+  button {
+    min-height: 40px;
+  }
+
+  /* Reduce font sizes slightly on very small screens */
+  .text-4xl {
+    font-size: 1.75rem !important;
+  }
+}
+
+/* Tablet (768–1024px): 2-col KPI, sidebar narrower */
+@media (min-width: 768px) and (max-width: 1024px) {
+  .grid.grid-cols-3 {
+    grid-template-columns: 1fr 1fr !important;
+  }
+}
+
+/* Improve touch target for drag handles on tablet */
+@media (pointer: coarse) {
+  .cursor-grab {
+    padding: 8px;
+    font-size: 1.2rem;
+  }
+}
+
+/* Optimistic UI — dim while loading (Transversal) */
+.loading-dim {
+  opacity: 0.5;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}

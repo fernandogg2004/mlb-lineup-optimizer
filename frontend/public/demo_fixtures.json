@@ -1,0 +1,179 @@
+{
+  "_comment": "DEMO fixtures — all records share game_pk=745400 for end-to-end coherence (Bug 1 fix). Never mix fixtures from different game_pks in the same render.",
+  "reports": [
+    {
+      "game_pk": 745400,
+      "game_date": "2026-05-20",
+      "matchup": "NYY 5  ·  TOR 3",
+      "game_result": true,
+      "actual_home_runs": 5,
+      "actual_away_runs": 3,
+      "projected_runs": 4.87,
+      "win_probability_projected": 0.59,
+      "model_log_loss": 0.412,
+      "model_version": "v2.1.0",
+      "std_dev": 1.24,
+      "percentile_10": 3.1,
+      "percentile_25": 3.9,
+      "percentile_75": 5.8,
+      "percentile_90": 7.2,
+      "win_prob_ci_low": 0.51,
+      "win_prob_ci_high": 0.67,
+      "simulation_n": 10000,
+      "uncertainty_level": "medium",
+      "pitcher_hand": "R",
+      "proposed_lineup": [
+        { "order": 1, "name": "Juan Soto",        "pos": "RF" },
+        { "order": 2, "name": "Aaron Judge",       "pos": "CF" },
+        { "order": 3, "name": "Giancarlo Stanton", "pos": "DH" },
+        { "order": 4, "name": "Anthony Rizzo",     "pos": "1B" },
+        { "order": 5, "name": "Gleyber Torres",    "pos": "2B" },
+        { "order": 6, "name": "Jazz Chisholm Jr.", "pos": "3B" },
+        { "order": 7, "name": "Austin Wells",      "pos": "C"  },
+        { "order": 8, "name": "Oswaldo Cabrera",   "pos": "LF" },
+        { "order": 9, "name": "Anthony Volpe",     "pos": "SS" }
+      ],
+      "actual_lineup": [
+        { "order": 1, "name": "Aaron Judge",       "pos": "CF", "result": "2-for-4, HR" },
+        { "order": 2, "name": "Juan Soto",         "pos": "RF", "result": "1-for-3, 2 BB" },
+        { "order": 3, "name": "Giancarlo Stanton", "pos": "DH", "result": "1-for-4, RBI" },
+        { "order": 4, "name": "Anthony Rizzo",     "pos": "1B", "result": "0-for-4" },
+        { "order": 5, "name": "Gleyber Torres",    "pos": "2B", "result": "1-for-3, BB" },
+        { "order": 6, "name": "Jazz Chisholm Jr.", "pos": "3B", "result": "0-for-4, 2K" },
+        { "order": 7, "name": "Austin Wells",      "pos": "C",  "result": "1-for-3" },
+        { "order": 8, "name": "Anthony Volpe",     "pos": "SS", "result": "2-for-4" },
+        { "order": 9, "name": "Oswaldo Cabrera",   "pos": "LF", "result": "0-for-3" }
+      ],
+      "divergences": [
+        {
+          "slot": 1,
+          "model_player": "Juan Soto",   "model_pos": "RF",
+          "manager_player": "Aaron Judge", "manager_pos": "CF",
+          "delta_er": 0.03,
+          "match": false,
+          "top_factors": [
+            { "factor": "OBP slot #1: Soto .415 vs Judge .404 (leadoff leverage)", "shap_value": 0.08, "direction": "favor_modelo" },
+            { "factor": "Judge: HR vs RHP esta semana (+0.11 wOBA situacional)", "shap_value": 0.11, "direction": "favor_manager" },
+            { "factor": "Platoon: Soto LHB vs Gausman RHP — ventaja modelo", "shap_value": 0.06, "direction": "favor_modelo" }
+          ]
+        },
+        {
+          "slot": 2,
+          "model_player": "Aaron Judge",  "model_pos": "CF",
+          "manager_player": "Juan Soto",  "manager_pos": "RF",
+          "delta_er": -0.05,
+          "match": false,
+          "top_factors": [
+            { "factor": "wOBA: Judge .431 vs Soto .392 en slot #2 (Δ=+0.039)", "shap_value": 0.12, "direction": "favor_modelo" },
+            { "factor": "PA/juego slot #2 = 4.6 — crítico para wOBA acumulado", "shap_value": 0.07, "direction": "favor_modelo" },
+            { "factor": "Soto: 6 hits últimos 14 AB en Yankee Stadium (momentum)", "shap_value": 0.04, "direction": "favor_manager" }
+          ]
+        },
+        {
+          "slot": 3, "model_player": "Giancarlo Stanton", "model_pos": "DH",
+          "manager_player": "Giancarlo Stanton", "manager_pos": "DH",
+          "delta_er": 0.0, "match": true, "top_factors": []
+        },
+        {
+          "slot": 4, "model_player": "Anthony Rizzo", "model_pos": "1B",
+          "manager_player": "Anthony Rizzo", "manager_pos": "1B",
+          "delta_er": 0.0, "match": true, "top_factors": []
+        },
+        {
+          "slot": 5, "model_player": "Gleyber Torres", "model_pos": "2B",
+          "manager_player": "Gleyber Torres", "manager_pos": "2B",
+          "delta_er": 0.0, "match": true, "top_factors": []
+        },
+        {
+          "slot": 6, "model_player": "Jazz Chisholm Jr.", "model_pos": "3B",
+          "manager_player": "Jazz Chisholm Jr.", "manager_pos": "3B",
+          "delta_er": 0.0, "match": true, "top_factors": []
+        },
+        {
+          "slot": 7, "model_player": "Austin Wells", "model_pos": "C",
+          "manager_player": "Austin Wells", "manager_pos": "C",
+          "delta_er": 0.0, "match": true, "top_factors": []
+        },
+        {
+          "slot": 8,
+          "model_player": "Oswaldo Cabrera", "model_pos": "LF",
+          "manager_player": "Anthony Volpe",  "manager_pos": "SS",
+          "delta_er": 0.01,
+          "match": false,
+          "top_factors": [
+            { "factor": "Volpe OBP .305 vs Cabrera OBP .275 en slot #8", "shap_value": 0.03, "direction": "favor_manager" },
+            { "factor": "Cabrera wOBA .265 vs Volpe wOBA .288 (Δ=-0.023)", "shap_value": 0.02, "direction": "favor_manager" },
+            { "factor": "Slot #8 PA/juego = 3.2 — impacto marginal", "shap_value": 0.01, "direction": "favor_manager" }
+          ]
+        },
+        {
+          "slot": 9,
+          "model_player": "Anthony Volpe",   "model_pos": "SS",
+          "manager_player": "Oswaldo Cabrera","manager_pos": "LF",
+          "delta_er": -0.01,
+          "match": false,
+          "top_factors": [
+            { "factor": "Volpe OBP .305 > Cabrera OBP .275 — segundo leadoff slot #9", "shap_value": 0.03, "direction": "favor_modelo" },
+            { "factor": "Slot #9 PA/juego = 3.0 — mínima palanca", "shap_value": 0.01, "direction": "favor_modelo" }
+          ]
+        }
+      ],
+      "report_markdown": "## Post-Game Analysis — NYY 5, TOR 3\n**Fecha:** 2026-05-20 | **Modelo:** v2.1.0\n\n### Evaluación\n| Métrica | Valor |\n|---|---|\n| E[R] proyectado | 4.87 |\n| Carreras reales | **5** |\n| Win Prob. proyectada | 59% |\n\n### Decisión destacada\nEl manager invirtió los slots #1 y #2 (Judge delante de Soto). El HR de Judge en el 4to validó ex-post la decisión táctica, aunque el modelo tiene ventaja probabilística con Soto en #1 contra RHP."
+    },
+    {
+      "game_pk": 745401,
+      "game_date": "2026-05-20",
+      "matchup": "LAD 7  ·  SFG 2",
+      "game_result": true,
+      "actual_home_runs": 7,
+      "actual_away_runs": 2,
+      "projected_runs": 5.12,
+      "win_probability_projected": 0.64,
+      "model_log_loss": 0.381,
+      "model_version": "v2.1.0",
+      "std_dev": 1.08,
+      "percentile_10": 3.4,
+      "percentile_25": 4.2,
+      "percentile_75": 6.1,
+      "percentile_90": 7.8,
+      "win_prob_ci_low": 0.57,
+      "win_prob_ci_high": 0.71,
+      "simulation_n": 10000,
+      "uncertainty_level": "medium",
+      "pitcher_hand": "R",
+      "proposed_lineup": [
+        { "order": 1, "name": "Shohei Ohtani",    "pos": "DH" },
+        { "order": 2, "name": "Freddie Freeman",   "pos": "1B" },
+        { "order": 3, "name": "Mookie Betts",      "pos": "RF" },
+        { "order": 4, "name": "Teoscar Hernandez", "pos": "LF" },
+        { "order": 5, "name": "Will Smith",        "pos": "C"  },
+        { "order": 6, "name": "Max Muncy",         "pos": "3B" },
+        { "order": 7, "name": "Gavin Lux",         "pos": "2B" },
+        { "order": 8, "name": "Miguel Rojas",      "pos": "SS" },
+        { "order": 9, "name": "James Outman",      "pos": "CF" }
+      ],
+      "actual_lineup": [
+        { "order": 1, "name": "Shohei Ohtani",    "pos": "DH", "result": "3-for-5, 2 HR" },
+        { "order": 2, "name": "Freddie Freeman",   "pos": "1B", "result": "2-for-4, RBI" },
+        { "order": 3, "name": "Mookie Betts",      "pos": "RF", "result": "1-for-4, BB" },
+        { "order": 4, "name": "Teoscar Hernandez", "pos": "LF", "result": "1-for-3, RBI" },
+        { "order": 5, "name": "Will Smith",        "pos": "C",  "result": "0-for-4" },
+        { "order": 6, "name": "Max Muncy",         "pos": "3B", "result": "1-for-3, HR" },
+        { "order": 7, "name": "Gavin Lux",         "pos": "2B", "result": "0-for-4" },
+        { "order": 8, "name": "Miguel Rojas",      "pos": "SS", "result": "1-for-3" },
+        { "order": 9, "name": "James Outman",      "pos": "CF", "result": "0-for-3" }
+      ],
+      "divergences": [],
+      "report_markdown": "## Post-Game Analysis — LAD 7, SFG 2\n**Fecha:** 2026-05-20 | **Modelo:** v2.1.0\n\nEl manager siguió exactamente el lineup propuesto por el modelo. Resultado validado con 7 carreras reales vs 5.12 proyectadas."
+    }
+  ],
+  "rolling_metrics": {
+    "log_loss_rolling_100": 0.389,
+    "log_loss_baseline_elo": 0.431,
+    "brier_score_season": 0.201,
+    "brier_score_benchmark": 0.228,
+    "n_games_evaluated": 47,
+    "n_games_season": 162,
+    "model_percentile": 78
+  }
+}

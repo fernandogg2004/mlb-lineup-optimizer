@@ -177,6 +177,35 @@ GOLD_BATTER_FEATURES_SCHEMA = StructType(
 )
 
 
+# Gold: pre-aggregated rolling pitcher features (Mejora 3).
+# Captures recent form, fatigue, and velocity trends for each pitcher.
+GOLD_PITCHER_ROLLING_SCHEMA = StructType(
+    [
+        StructField("feature_date",               StringType(),  nullable=False),  # partition key
+        StructField("pitcher_id",                 IntegerType(), nullable=False),
+        StructField("season",                     ShortType(),   nullable=False),
+        # Workload & rest
+        StructField("pitches_7d",                 IntegerType(), nullable=True),
+        StructField("pitches_3d",                 IntegerType(), nullable=True),
+        StructField("days_since_last_app",        IntegerType(), nullable=True),
+        # Fastball velocity recent & medium-term
+        StructField("velo_ff_7d",                 FloatType(),   nullable=True),
+        StructField("velo_ff_21d",                FloatType(),   nullable=True),
+        StructField("velo_ff_delta_7d_vs_30d",    FloatType(),   nullable=True),
+        # Spin rate by pitch type
+        StructField("spin_ff_7d",                 FloatType(),   nullable=True),
+        StructField("spin_sl_7d",                 FloatType(),   nullable=True),
+        # Dominance metrics
+        StructField("whiff_rate_7d",              FloatType(),   nullable=True),
+        StructField("csw_rate_7d",                FloatType(),   nullable=True),
+        # Intra-start fatigue signal
+        StructField("velo_inning_slope_last_start", FloatType(), nullable=True),
+        # Handedness
+        StructField("p_throws_binary",            ShortType(),   nullable=True),
+    ]
+)
+
+
 # ---------------------------------------------------------------------------
 # Configuration dataclass
 # ---------------------------------------------------------------------------
@@ -539,7 +568,25 @@ def setup_lakehouse(config: LakehouseConfig) -> None:
         partition_keys=["feature_date"],
     )
 
-    log.info("catalog_setup_complete", tables_registered=3)
+    # Gold: pitcher rolling features (Mejora 3)
+    gold_pitcher_path = f"{config.gold_path}/pitcher_features_rolling"
+    create_delta_table_if_not_exists(
+        spark=spark,
+        table_path=gold_pitcher_path,
+        schema=GOLD_PITCHER_ROLLING_SCHEMA,
+        partition_by=["feature_date"],
+        table_properties={"delta.logRetentionDuration": "interval 1825 days"},
+    )
+    register_delta_table_in_glue(
+        glue_client=glue,
+        database=config.glue_database,
+        table_name="gold_pitcher_features_rolling",
+        s3_location=gold_pitcher_path,
+        schema=GOLD_PITCHER_ROLLING_SCHEMA,
+        partition_keys=["feature_date"],
+    )
+
+    log.info("catalog_setup_complete", tables_registered=4)
     spark.stop()
 
 

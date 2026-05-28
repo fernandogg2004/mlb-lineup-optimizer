@@ -64,6 +64,8 @@ class RetrainingConfig:
     gold_plate_appearances_path: Path = Path("data/gold/plate_appearances")
     gold_rolling_features_path: Path = Path("data/gold/rolling_features")
     gold_platoon_features_path: Path = Path("data/gold/platoon_features")
+    # Pitcher rolling features (Mejora 3); None = feature block omitted
+    gold_pitcher_rolling_path: Optional[Path] = None
 
     # Holdout window
     holdout_days: int = 14
@@ -170,12 +172,48 @@ class FeatureMatrixBuilder:
             how="left",
         )
 
-        # Select feature columns (all numeric non-key columns)
+        # --- Mejora 3: Join pitcher rolling features (optional) -------------
+        # When gold_pitcher_rolling_path is set, join pitcher form/fatigue
+        # features by (pitcher_id, game_date) — left join so missing entries
+        # produce nulls (imputed to 0 later in the feature_cols fill_null step).
+        if self._config.gold_pitcher_rolling_path is not None:
+            pitcher_rolling_df = pl.read_parquet(
+                self._config.gold_pitcher_rolling_path
+            ).rename({"feature_date": "game_date"})   # align join key
+            combined = combined.join(
+                pitcher_rolling_df,
+                on=["pitcher_id", "game_date"],
+                how="left",
+                suffix="_pr",   # avoid column name collisions
+            )
+            logger.info(
+                "pitcher_rolling_joined",
+                n_rows=len(combined),
+                pitcher_rolling_cols=len(pitcher_rolling_df.columns),
+            )
+
+        # --- Mejora 4: ERA encoding columns ---------------------------------
+        # These binary indicators capture structural MLB rule changes that shift
+        # outcome distributions.  Added as Int8 columns (no extra memory cost).
+        combined = combined.with_columns([
+            (pl.col("season") >= 2023).cast(pl.Int8).alias("era_shift_ban"),
+            (pl.col("season") >= 2020).cast(pl.Int8).alias("era_universal_dh"),
+            (pl.col("season") == 2023).cast(pl.Int8).alias("era_first_year_shift_ban"),
+        ])
+
+        # Select feature columns (all numeric non-key columns).
+        # Added pl.Int16 to include pitch_count_in_pa (ShortType in Silver schema,
+        # Mejora 2) and pl.Int8 for the era indicator columns (Mejora 4).
         label_col = "pa_outcome_int"
         key_cols = {"batter_id", "game_date", "season", label_col, "pa_id", "pitcher_id"}
         feature_cols = sorted(
             c for c in combined.columns
-            if c not in key_cols and combined[c].dtype in (pl.Float32, pl.Float64, pl.Int32, pl.Int64)
+            if c not in key_cols and combined[c].dtype in (
+                pl.Float32, pl.Float64,
+                pl.Int32, pl.Int64,
+                pl.Int16,   # pitch_count_in_pa (ShortType in Spark schema)
+                pl.Int8,    # era indicator columns
+            )
         )
 
         combined = combined.with_columns(
@@ -327,37 +365,55 @@ class GameDayRetrainingPipeline:
         y: np.ndarray,
         time_idx: np.ndarray,
         as_of_date: date,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Temporal train / holdout split with strict future-leak prevention."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Temporal train / holdout split with strict future-leak prevention.
+
+        The holdout window is further subdivided into two disjoint halves:
+            First  50% (chronologically earlier) → calibration set (X_cal / y_cal)
+            Second 50% (chronologically later)   → evaluation set  (X_val / y_val)
+
+        This prevents the isotonic calibrator from over-fitting to the same data
+        used for LightGBM early stopping, which caused ECE to be optimistically
+        biased by ~0.005–0.012.
+
+        Returns:
+            (X_train, y_train, X_val, y_val, X_cal, y_cal) — six arrays.
+        """
         cutoff = int(
             (as_of_date - timedelta(days=self._config.holdout_days))
             .isoformat()
             .replace("-", "")
         )
         train_mask = time_idx < cutoff
-        val_mask = time_idx >= cutoff
+        holdout_mask = time_idx >= cutoff
 
         X_train, y_train = X[train_mask], y[train_mask]
-        X_val, y_val = X[val_mask], y[val_mask]
+        X_holdout, y_holdout = X[holdout_mask], y[holdout_mask]
 
         if len(X_train) < self._config.min_training_samples:
             raise ValueError(
                 f"Insufficient training samples: {len(X_train)} < "
                 f"{self._config.min_training_samples}"
             )
-        if len(X_val) < self._config.min_holdout_samples:
+        if len(X_holdout) < self._config.min_holdout_samples:
             raise ValueError(
-                f"Insufficient holdout samples: {len(X_val)} < "
+                f"Insufficient holdout samples: {len(X_holdout)} < "
                 f"{self._config.min_holdout_samples}"
             )
+
+        # Chronological split of holdout: first half → cal, second half → eval
+        mid = len(X_holdout) // 2
+        X_cal, y_cal = X_holdout[:mid], y_holdout[:mid]
+        X_val, y_val = X_holdout[mid:], y_holdout[mid:]
 
         logger.info(
             "dataset_split",
             training_samples=len(X_train),
-            holdout_samples=len(X_val),
+            cal_samples=len(X_cal),
+            eval_samples=len(X_val),
             cutoff_date=cutoff,
         )
-        return X_train, y_train, X_val, y_val
+        return X_train, y_train, X_val, y_val, X_cal, y_cal
 
     def _train_model(
         self,
@@ -365,10 +421,20 @@ class GameDayRetrainingPipeline:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        X_cal: np.ndarray | None = None,
+        y_cal: np.ndarray | None = None,
     ) -> AtBatPredictor:
-        """Train a fresh AtBatPredictor on the full training window."""
+        """Train a fresh AtBatPredictor on the full training window.
+
+        Args:
+            X_train / y_train: Full training data.
+            X_val / y_val: Evaluation holdout used for early stopping and ECE.
+            X_cal / y_cal: Calibration set (separate temporal split).  When
+                provided, the isotonic calibrator is fit here instead of X_val,
+                eliminating the calibration-evaluation set overlap.
+        """
         predictor = AtBatPredictor(config=self._config.model_config)
-        predictor.fit(X_train, y_train, X_val, y_val)
+        predictor.fit(X_train, y_train, X_val, y_val, X_cal, y_cal)
         return predictor
 
     def _evaluate_model(
@@ -454,7 +520,9 @@ class GameDayRetrainingPipeline:
         try:
             # Step 3: Load features
             X, y, time_idx = self._feature_builder.load(as_of_date)
-            X_train, y_train, X_val, y_val = self._build_splits(X, y, time_idx, as_of_date)
+            X_train, y_train, X_val, y_val, X_cal, y_cal = self._build_splits(
+                X, y, time_idx, as_of_date
+            )
 
             with self._registry.managed_run(
                 run_name=run_name,
@@ -465,9 +533,9 @@ class GameDayRetrainingPipeline:
                 # Step 4: Log config
                 self._registry.log_model_config(self._config.model_config)
 
-                # Step 5: Train
+                # Step 5: Train (separate cal set prevents calibration leak)
                 logger.info("training_model", run_id=mlflow_run_id)
-                predictor = self._train_model(X_train, y_train, X_val, y_val)
+                predictor = self._train_model(X_train, y_train, X_val, y_val, X_cal, y_cal)
 
                 # Step 6: Evaluate
                 metrics = self._evaluate_model(predictor, X_val, y_val)

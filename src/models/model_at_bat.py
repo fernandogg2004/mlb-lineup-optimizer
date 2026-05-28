@@ -90,24 +90,34 @@ warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
 # ---------------------------------------------------------------------------
 
 class PAOutcome(IntEnum):
-    """Integer encoding for the 7 PA outcome classes."""
+    """Integer encoding for the 8 PA outcome classes.
 
-    OUT_IN_PLAY = 0
-    STRIKEOUT   = 1
-    WALK_HBP    = 2
-    SINGLE      = 3
-    DOUBLE      = 4
-    TRIPLE      = 5
-    HOME_RUN    = 6
+    Class 7 (DOUBLE_PLAY) was added in Mejora 6 to explicitly model GIDP and
+    strikeout-double-play events, which add 2 outs AND eliminate the runner on
+    first base — a qualitatively different state transition from a regular out.
+    The coordinated simulator change must be deployed simultaneously with the
+    model retrain that produces 8-class probability vectors.
+    """
+
+    OUT_IN_PLAY   = 0
+    STRIKEOUT     = 1
+    WALK_HBP      = 2
+    SINGLE        = 3
+    DOUBLE        = 4
+    TRIPLE        = 5
+    HOME_RUN      = 6
+    DOUBLE_PLAY   = 7   # GIDP or strikeout_double_play (Mejora 6)
 
 
 OUTCOME_NAMES: list[str] = [o.name for o in PAOutcome]
-N_CLASSES: int = len(PAOutcome)
+N_CLASSES: int = len(PAOutcome)   # 8
 
 # Linear run values (used for sanity-check of calibrated probs)
-# Source: FanGraphs 2024 linear weights
+# Sources: FanGraphs 2024 linear weights (indices 0-6) +
+#          Retrosheet 2015-2024 for DOUBLE_PLAY (index 7):
+#          GIDP creates 2 outs AND removes runner on 1B → approx -0.43 wOBA penalty
 RUN_VALUES: np.ndarray = np.array(
-    [0.00, 0.00, 0.33, 0.47, 0.77, 1.04, 1.40], dtype=np.float32
+    [0.00, 0.00, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43], dtype=np.float32
 )
 
 
@@ -151,7 +161,11 @@ class AtBatModelConfig:
     reg_alpha: float = 0.10
     reg_lambda: float = 1.50
     max_bin: int = 255
-    class_weight: Optional[str] = "balanced"
+    # class_weight: "balanced" with 8 classes at 0.78%–45% creates a 128:1
+    # weight ratio that destabilizes LightGBM training (best_iteration=1).
+    # Using None (unweighted) + isotonic calibration achieves the same ECE goal
+    # without training instability. Can revisit with manual log-scaled weights.
+    class_weight: Optional[str] = None
     calibration_method: str = "isotonic"
     ece_n_bins: int = 10
     ece_target: float = 0.035
@@ -355,47 +369,84 @@ class AtBatPredictor:
         y_train: np.ndarray,
         X_val: np.ndarray,
         y_val: np.ndarray,
+        X_cal: Optional[np.ndarray] = None,
+        y_cal: Optional[np.ndarray] = None,
         feature_names: Optional[list[str]] = None,
     ) -> "AtBatPredictor":
         """Trains the base LightGBM model and applies post-hoc calibration.
 
         Training sequence:
         1. Train LightGBM with early stopping on ``(X_val, y_val)``.
-        2. Calibrate the base model on the same validation set using
-           ``CalibratedClassifierCV(cv='prefit')``.
-        3. Compute ECE on the validation set for both raw and calibrated models.
+        2. Calibrate the base model on ``(X_cal, y_cal)`` — a *separate* held-out
+           set that was NOT used for early stopping.  If ``X_cal`` is ``None``,
+           falls back to ``(X_val, y_val)`` with a ``calibration_LEAK_WARNING``
+           log entry (backwards-compatible but biased ECE).
+        3. Compute ECE on both ``X_cal`` (in-domain) and ``X_val`` (holdout) to
+           expose the calibration-set vs. evaluation-set gap.
         4. If calibrated ECE > ``config.ece_target``, emit a warning but do
            NOT fall back silently — the caller must decide what to do.
         5. Log all metrics and the calibrated model artifact to MLflow.
 
         Args:
             X_train: Training feature matrix, shape (N_train, D).
-            y_train: Training labels, shape (N_train,). Integer in [0, 6].
-            X_val: Validation feature matrix, shape (N_val, D).
-            y_val: Validation labels, shape (N_val,).
+            y_train: Training labels, shape (N_train,). Integer in [0, N_CLASSES-1].
+            X_val: Validation feature matrix used for LightGBM early stopping
+                and for the *holdout* ECE metric.  Shape (N_val, D).
+            y_val: Validation labels for early stopping / holdout ECE, shape (N_val,).
+            X_cal: Calibration feature matrix, shape (N_cal, D).  Should be a
+                disjoint temporal split *earlier* than ``X_val`` so that the
+                isotonic/sigmoid calibrator never sees the evaluation set.
+                If ``None``, ``X_val``/``y_val`` are reused with a warning.
+            y_cal: Calibration labels, shape (N_cal,).  Required when ``X_cal``
+                is not ``None``.
             feature_names: Optional list of D feature names for SHAP/logging.
 
         Returns:
             ``self`` (fluent interface).
 
         Raises:
-            ValueError: If labels contain values outside [0, 6].
+            ValueError: If labels contain values outside [0, N_CLASSES-1].
+            ValueError: If ``X_cal`` is provided but ``y_cal`` is ``None``.
         """
+        # --- Guard: X_cal and y_cal must be provided together ---
+        if (X_cal is None) != (y_cal is None):
+            raise ValueError("X_cal and y_cal must both be provided or both be None.")
+
+        # --- Backwards-compatible leak fallback ---
+        if X_cal is None:
+            log.warning(
+                "calibration_LEAK_WARNING",
+                msg=(
+                    "X_cal is None — using X_val for both early-stopping AND calibration. "
+                    "ECE will be optimistically biased by ~0.005–0.012. "
+                    "Pass separate X_cal / y_cal to fix this."
+                ),
+            )
+            X_cal_eff, y_cal_eff = X_val, y_val
+            _separate_cal = False
+        else:
+            X_cal_eff, y_cal_eff = X_cal, y_cal
+            _separate_cal = True
+
         # Validate labels
-        unique_labels = np.unique(np.concatenate([y_train, y_val]))
+        unique_labels = np.unique(np.concatenate([y_train, y_val, y_cal_eff]))
         invalid = set(unique_labels.tolist()) - set(range(N_CLASSES))
         if invalid:
-            raise ValueError(f"Labels contain invalid values: {invalid}. Must be in [0, 6].")
+            raise ValueError(
+                f"Labels contain invalid values: {invalid}. Must be in [0, {N_CLASSES - 1}]."
+            )
 
         self._feature_names = feature_names
+        self._n_features = X_train.shape[1]
         cfg = self.config
 
         mlflow.set_experiment(cfg.mlflow_experiment)
         with mlflow.start_run(run_name="lgbm-calibrated-v1") as run:
             self._log_mlflow_params(run.info.run_id)
+            mlflow.log_param("separate_calibration_set", _separate_cal)
 
             # ----------------------------------------------------------
-            # Step 1: Train base LightGBM with early stopping
+            # Step 1: Train base LightGBM with early stopping on X_val
             # ----------------------------------------------------------
             self._base_model = self._build_lgbm()
             callbacks = [
@@ -414,7 +465,7 @@ class AtBatPredictor:
             best_iter = self._base_model.best_iteration_
             log.info("lgbm_trained", best_iteration=best_iter)
 
-            # Raw probabilities and metrics
+            # Raw probabilities and metrics on the holdout (X_val)
             raw_probs_val = self._base_model.predict_proba(X_val)
             raw_logloss = log_loss(y_val, raw_probs_val)
             raw_ece = self._ece_computer.compute(y_val, raw_probs_val)["overall_ece"]
@@ -422,7 +473,7 @@ class AtBatPredictor:
             mlflow.log_metrics({"raw_logloss": raw_logloss, "raw_ece": raw_ece})
 
             # ----------------------------------------------------------
-            # Step 2: Post-hoc calibration on the validation set
+            # Step 2: Post-hoc calibration on the *calibration* set (X_cal)
             # ----------------------------------------------------------
             self._calibrated_model = CalibratedClassifierCV(
                 estimator=self._base_model,
@@ -430,31 +481,46 @@ class AtBatPredictor:
                 method=cfg.calibration_method,
                 n_jobs=cfg.n_jobs,
             )
-            self._calibrated_model.fit(X_val, y_val)
-            log.info("calibration_applied", method=cfg.calibration_method)
+            self._calibrated_model.fit(X_cal_eff, y_cal_eff)   # ← fixed: uses X_cal, not X_val
+            log.info(
+                "calibration_applied",
+                method=cfg.calibration_method,
+                cal_samples=len(X_cal_eff),
+                separate_set=_separate_cal,
+            )
 
             # ----------------------------------------------------------
-            # Step 3: Evaluate calibration quality
+            # Step 3: Evaluate calibration quality — TWO metrics
+            #   cal_ece_in_domain : ECE on X_cal (the set the calibrator was fit on)
+            #   cal_ece_holdout   : ECE on X_val (true unseen evaluation set)
+            # When a separate cal set is used, holdout ≥ in_domain should hold.
+            # When they are the same set (leak fallback), both are equal and biased.
             # ----------------------------------------------------------
+            cal_probs_cal = self._calibrated_model.predict_proba(X_cal_eff)
+            ece_in_domain = self._ece_computer.compute(y_cal_eff, cal_probs_cal)["overall_ece"]
+
             cal_probs_val = self._calibrated_model.predict_proba(X_val)
-            cal_logloss = log_loss(y_val, cal_probs_val)
-            ece_result = self._ece_computer.compute(y_val, cal_probs_val)
-            cal_ece = ece_result["overall_ece"]
+            cal_logloss   = log_loss(y_val, cal_probs_val)
+            ece_result    = self._ece_computer.compute(y_val, cal_probs_val)
+            cal_ece       = ece_result["overall_ece"]   # holdout ECE (the real metric)
 
             log.info(
                 "calibrated_metrics",
+                cal_ece_in_domain=round(ece_in_domain, 5),
+                cal_ece_holdout=round(cal_ece, 5),
                 logloss=round(cal_logloss, 5),
-                ece=round(cal_ece, 5),
                 ece_target=cfg.ece_target,
                 target_met=cal_ece <= cfg.ece_target,
             )
             mlflow.log_metrics({
                 "cal_logloss": cal_logloss,
-                "cal_ece": cal_ece,
+                "cal_ece": cal_ece,                      # alias kept for dashboard backwards-compat
+                "cal_ece_in_domain": ece_in_domain,
+                "cal_ece_holdout": cal_ece,
                 "ece_reduction_pct": round((raw_ece - cal_ece) / max(raw_ece, 1e-9) * 100, 1),
             })
 
-            # Per-class ECE logging
+            # Per-class ECE logging (on holdout)
             for name, ece_c in zip(ece_result["per_class_names"], ece_result["per_class_ece"]):
                 mlflow.log_metric(f"ece_{name.lower()}", round(ece_c, 5))
 
@@ -648,13 +714,17 @@ class AtBatPredictor:
         for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
             log.info("cv_fold_start", fold=fold, train_size=len(train_idx), val_size=len(val_idx))
             fold_predictor = AtBatPredictor(self.config)
-            # Use first half of val for calibration, second half for evaluation
+            # Split val into two disjoint temporal halves:
+            #   cal_idx  → calibration set  (passed to fit() as X_cal)
+            #   eval_idx → evaluation set   (passed as X_val for early-stopping signal
+            #               AND used independently for the final ECE metric)
             mid = len(val_idx) // 2
             cal_idx, eval_idx = val_idx[:mid], val_idx[mid:]
 
             fold_predictor.fit(
-                X[train_idx], y[train_idx],
-                X[cal_idx],   y[cal_idx],
+                X[train_idx], y[train_idx],     # training data
+                X[eval_idx],  y[eval_idx],       # X_val  — early stopping + holdout ECE
+                X[cal_idx],   y[cal_idx],         # X_cal  — isotonic calibration (separate)
             )
             metrics = fold_predictor.evaluate_calibration(X[eval_idx], y[eval_idx])
             metrics["fold"] = fold
@@ -735,10 +805,11 @@ class AtBatPredictor:
             "base_model": self._base_model,
             "config": self.config,
             "feature_names": self._feature_names,
+            "n_features": self._n_features,
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-        log.info("predictor_saved", path=path)
+        log.info("predictor_saved", path=path, n_features=self._n_features)
 
     @classmethod
     def load(cls, path: str) -> "AtBatPredictor":
@@ -774,8 +845,23 @@ class AtBatPredictor:
         predictor._calibrated_model = payload["calibrated_model"]
         predictor._base_model       = payload["base_model"]
         predictor._feature_names    = payload["feature_names"]
+        predictor._n_features       = payload.get("n_features")   # None for legacy pickles
         predictor._is_fitted        = True
-        log.info("predictor_loaded", path=path)
+
+        # Guard against silent dimensionality mismatches at serving time
+        n_classes = getattr(predictor._calibrated_model, "classes_", None)
+        if n_classes is not None and len(n_classes) != N_CLASSES:
+            raise ValueError(
+                f"Loaded model has {len(n_classes)} classes, expected {N_CLASSES}. "
+                "The model was trained with a different N_CLASSES — retrain required."
+            )
+
+        log.info(
+            "predictor_loaded",
+            path=path,
+            n_features=predictor._n_features,
+            n_classes=N_CLASSES,
+        )
         return predictor
 
     # ------------------------------------------------------------------
@@ -802,12 +888,25 @@ class AtBatPredictor:
 # Feature matrix builder (upstream pipeline contract)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Feature-specific imputation values (Mejora 2)
+# ---------------------------------------------------------------------------
+# When a context column is present but has nulls, these medians replace NaN
+# instead of the generic 0.0 fallback, preserving distributional meaning.
+# All values are Statcast 2015-2024 MLB medians unless noted.
+_CONTEXT_MEDIAN_IMPUTES: dict[str, float] = {
+    "pitch_count_in_pa":      4.0,   # median PA length (pitches)
+    # Era indicator columns default to 0 (pre-era); no custom impute needed.
+}
+
+
 def build_feature_matrix(
     rolling_df: pl.DataFrame,
     platoon_df: pl.DataFrame,
     embeddings_batter: np.ndarray,
     embeddings_pitcher: np.ndarray,
     context_df: pl.DataFrame,
+    pitcher_rolling_df: Optional[pl.DataFrame] = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Assembles the full ~340-dimensional feature vector for each PA.
 
@@ -824,9 +923,13 @@ def build_feature_matrix(
         - Pitcher arsenal (per pitch type: velocity, spin, break, usage): ~63 dims
         - Weather vector (temp, humidity, wind_u, wind_v, pressure): 5 dims
         - Park factors (dynamic HR, XB, 1B factors): 3 dims
-        - Contextual (inning, outs, bases_state, score_diff): 6 dims
+        - Contextual (inning, outs, bases_state, score_diff,
+                      pitch_count_in_pa [Mejora 2],
+                      era_shift_ban, era_universal_dh,
+                      era_first_year_shift_ban [Mejora 4]): ~9 dims
         - Season/era encoding (cyclic sin/cos): 4 dims
-        Total: ~161 dims base + pitch arsenal = ~224 dims
+        - Pitcher rolling features (velo, spin, fatigue [Mejora 3]): ~18 dims (optional)
+        Total: ~169 dims base + pitch arsenal ≈ ~224–242 dims
 
     Args:
         rolling_df: Batter rolling features from Phase 2.2 (one row per batter).
@@ -834,33 +937,55 @@ def build_feature_matrix(
         embeddings_batter: Batter latent vectors, shape (N_batters, 16).
         embeddings_pitcher: Pitcher latent vectors, shape (N_pitchers, 16).
         context_df: Game context features (venue, weather, inning, etc.).
+            Must contain ``pitch_count_in_pa`` (Mejora 2) and era columns
+            (Mejora 4) if available.  Missing columns are silently omitted.
+        pitcher_rolling_df: Optional pitcher rolling features from
+            ``features_pitcher_rolling.py`` (Mejora 3).  When ``None`` the
+            pitcher rolling block is omitted — backwards compatible.
 
     Returns:
         Tuple of (feature_matrix, feature_names) where feature_matrix is
         shape (N, D) float32 and feature_names is a list of D column names.
 
     Note:
-        This is a stub implementation. In production, all DataFrames are
-        pre-joined by (batter_id, pitcher_id, game_date) before passing here.
+        In production, all DataFrames are pre-joined by
+        (batter_id, pitcher_id, game_date) before passing here.
+
+    Serving note:
+        ``pitch_count_in_pa`` has two serving modes:
+          - Pre-game lineup prediction: impute with 4.0 (historical median).
+          - Live in-PA tracking: use the real-time pitch count from the
+            Statcast polling feed (``statcast_ingestion.py``).
+        Both modes call this function identically; the difference is upstream
+        (the context_df row passed in).
     """
     # Collect feature blocks
     rolling_cols = [c for c in rolling_df.columns if c not in {"batter_id", "feature_date"}]
     platoon_cols = [c for c in platoon_df.columns if c.endswith("_stabilized")]
     context_cols = [c for c in context_df.columns if c not in {"batter_id", "pitcher_id", "game_date"}]
 
-    rolling_arr   = rolling_df.select(rolling_cols).to_numpy(allow_copy=True).astype(np.float32)
-    platoon_arr   = platoon_df.select(platoon_cols).to_numpy(allow_copy=True).astype(np.float32)
-    context_arr   = context_df.select(context_cols).to_numpy(allow_copy=True).astype(np.float32)
+    rolling_arr = rolling_df.select(rolling_cols).to_numpy(allow_copy=True).astype(np.float32)
+    platoon_arr = platoon_df.select(platoon_cols).to_numpy(allow_copy=True).astype(np.float32)
+    context_arr = context_df.select(context_cols).to_numpy(allow_copy=True).astype(np.float32)
 
-    feature_matrix = np.hstack([
+    # --- Feature-specific null imputation (Mejora 2) ---
+    # Apply domain-aware imputes BEFORE the generic nan_to_num below.
+    for col_name, fill_value in _CONTEXT_MEDIAN_IMPUTES.items():
+        if col_name in context_cols:
+            col_idx = context_cols.index(col_name)
+            null_mask = np.isnan(context_arr[:, col_idx])
+            if null_mask.any():
+                context_arr[null_mask, col_idx] = fill_value
+
+    # Assemble blocks
+    blocks: list[np.ndarray] = [
         rolling_arr,
         platoon_arr,
         embeddings_batter.astype(np.float32),
         embeddings_pitcher.astype(np.float32),
         context_arr,
-    ])
-
-    feature_names = (
+    ]
+    names: list[str] = (
         rolling_cols
         + platoon_cols
         + [f"batter_z_{i}" for i in range(embeddings_batter.shape[1])]
@@ -868,10 +993,24 @@ def build_feature_matrix(
         + context_cols
     )
 
-    # Replace NaN with 0.0 (missing rolling windows for new players)
+    # --- Pitcher rolling features (Mejora 3, optional) ---
+    if pitcher_rolling_df is not None:
+        p_exclude = {"pitcher_id", "feature_date", "season"}
+        pitcher_roll_cols = [c for c in pitcher_rolling_df.columns if c not in p_exclude]
+        pitcher_roll_arr  = (
+            pitcher_rolling_df.select(pitcher_roll_cols)
+            .to_numpy(allow_copy=True)
+            .astype(np.float32)
+        )
+        blocks.append(pitcher_roll_arr)
+        names.extend(pitcher_roll_cols)
+
+    feature_matrix = np.hstack(blocks)
+
+    # Replace remaining NaN (missing rolling windows for new players) with 0.0
     np.nan_to_num(feature_matrix, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
 
-    return feature_matrix, feature_names
+    return feature_matrix, names
 
 
 # ---------------------------------------------------------------------------
@@ -885,8 +1024,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train_p = sub.add_parser("train")
     train_p.add_argument("--features-path", required=True, dest="features_path")
     train_p.add_argument("--output-dir", default="models/", dest="output_dir")
-    train_p.add_argument("--val-seasons", default="2023", dest="val_seasons",
-                         help="Comma-separated season years to use as validation")
+    train_p.add_argument("--val-seasons", default="2024", dest="val_seasons",
+                         help="Comma-separated season years to use as validation. "
+                              "Default changed to 2024 so that the era_shift_ban (2023+) "
+                              "feature is included in training rather than held out.")
     train_p.add_argument("--experiment", default="pa-model-at-bat", dest="experiment")
 
     eval_p = sub.add_parser("evaluate")
@@ -915,20 +1056,38 @@ def main(argv: list[str] | None = None) -> None:
         label_col = "pa_outcome_idx"
         # Exclude per-PA Statcast outcome metrics: these are derived FROM the PA being
         # predicted and introduce target leakage, making the model unusable for inference.
+        # Also exclude identifier columns (batter_id, pitcher_id) that are not predictive
+        # features (they are high-cardinality IDs, not numeric features).
         _LEAKING = {"xwoba", "launch_speed", "launch_angle"}
+        _NON_FEATURES = {"batter_id", "pitcher_id", label_col, "season", "game_date"}
         feature_cols = [
             c for c in df.columns
-            if c not in {label_col, "season", "game_date"} | _LEAKING
+            if c not in _NON_FEATURES | _LEAKING
+            and df[c].dtype not in (pl.Utf8, pl.String, pl.Categorical)
         ]
 
         X_train = df.filter(train_mask).select(feature_cols).to_numpy().astype(np.float32)
         y_train = df.filter(train_mask)[label_col].to_numpy().astype(np.int32)
-        X_val   = df.filter(val_mask).select(feature_cols).to_numpy().astype(np.float32)
-        y_val   = df.filter(val_mask)[label_col].to_numpy().astype(np.int32)
+
+        # Split val into two chronological halves:
+        #   First half  → calibration (X_cal): the isotonic/sigmoid calibrator is fit here.
+        #   Second half → evaluation  (X_val): early stopping signal AND holdout ECE.
+        # Sorting by game_date ensures temporal ordering before the split.
+        val_df_sorted = df.filter(val_mask).sort("game_date")
+        mid = len(val_df_sorted) // 2
+        X_cal = val_df_sorted[:mid].select(feature_cols).to_numpy().astype(np.float32)
+        y_cal = val_df_sorted[:mid][label_col].to_numpy().astype(np.int32)
+        X_val = val_df_sorted[mid:].select(feature_cols).to_numpy().astype(np.float32)
+        y_val = val_df_sorted[mid:][label_col].to_numpy().astype(np.int32)
 
         config = AtBatModelConfig(mlflow_experiment=args.experiment)
         predictor = AtBatPredictor(config)
-        predictor.fit(X_train, y_train, X_val, y_val, feature_names=feature_cols)
+        predictor.fit(
+            X_train, y_train,
+            X_val, y_val,
+            X_cal, y_cal,
+            feature_names=feature_cols,
+        )
         predictor.save(f"{args.output_dir}/pa_predictor_v1.pkl")
 
     elif args.command == "evaluate":

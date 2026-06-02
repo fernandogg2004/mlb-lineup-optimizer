@@ -114,7 +114,11 @@ def post_game_report(game_date: str) -> None:
                 team   = p.get("team", "?")
                 exp_r  = p.get("expected_runs_per_game", 0)
                 roster = len(p.get("batting_order", []))
-                print(f"  Prediccion ({side}) {team}: E[R/partido] = {exp_r}  ({roster} bateadores)")
+                fip_ctx = p.get("opp_pitcher_stats", {})
+                fip_str = ""
+                if fip_ctx and not fip_ctx.get("fip_is_estimated"):
+                    fip_str = f"  FIP={fip_ctx['fip']:.2f} K/9={fip_ctx['k9']:.1f}"
+                print(f"  Prediccion ({side}) {team}: E[R/partido] = {exp_r}  ({roster} bateadores){fip_str}")
                 pred_runs[team] = exp_r
                 pred_details.append({"team": team, "side": side, "expected_runs_per_game": exp_r})
         else:

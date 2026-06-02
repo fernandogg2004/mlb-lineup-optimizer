@@ -53,6 +53,14 @@ OUTCOME_NAMES = ["OUT", "K", "BB/HBP", "1B", "2B", "3B", "HR", "DP"]
 RUN_VALUES    = np.array([0.0, 0.0, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43],
                           dtype=np.float32)
 
+# Post-hoc calibration scale for Monte Carlo E[R/game] output.
+# The model (trained with LOG_SCALED_CLASS_WEIGHTS) inflates hit probabilities,
+# causing the MC to predict ~5.07 runs/team when the MLB 2025-26 average is ~4.5.
+# Empirical: comparison_2026-05-27.json → predicted mean=5.07, actual mean=3.67 (15 games).
+# Conservative estimate uses MLB season average as target: 4.5 / 5.07 = 0.888.
+# Update this constant as more game results accumulate.
+_MC_RUNS_SCALE: float = 0.888
+
 MODEL_PATH = ROOT / "models" / "at_bat_predictor.pkl"
 SILVER_DIR = ROOT / "data" / "silver" / "plate_appearances"
 
@@ -536,17 +544,18 @@ def _run_game_simulation(
                      opp_lineup_probs.astype(np.float32))
 
     pct = sim.runs_scored_percentiles
+    s   = _MC_RUNS_SCALE   # post-hoc bias correction (see constant definition)
     return {
-        "expected_runs_per_game": round(sim.expected_runs_scored, 2),
-        "runs_p05":               round(pct[5],  1),
-        "runs_p25":               round(pct[25], 1),
-        "runs_p50":               round(pct[50], 1),
-        "runs_p75":               round(pct[75], 1),
-        "runs_p95":               round(pct[95], 1),
-        "win_probability":        round(sim.win_probability, 3),
-        "win_prob_ci_low":        round(sim.win_prob_ci_low, 3),
-        "win_prob_ci_high":       round(sim.win_prob_ci_high, 3),
-        "std_dev_runs":           round(sim.std_dev_runs_scored, 2),
+        "expected_runs_per_game": round(sim.expected_runs_scored * s, 2),
+        "runs_p05":               round(pct[5]  * s, 1),
+        "runs_p25":               round(pct[25] * s, 1),
+        "runs_p50":               round(pct[50] * s, 1),
+        "runs_p75":               round(pct[75] * s, 1),
+        "runs_p95":               round(pct[95] * s, 1),
+        "win_probability":        round(sim.win_probability, 3),      # no escalar
+        "win_prob_ci_low":        round(sim.win_prob_ci_low, 3),      # no escalar
+        "win_prob_ci_high":       round(sim.win_prob_ci_high, 3),     # no escalar
+        "std_dev_runs":           round(sim.std_dev_runs_scored * s, 2),
         "uncertainty":            sim.uncertainty_level,
         "n_simulations":          sim.n_simulations,
     }
@@ -713,9 +722,10 @@ def _predict_one_side(
             }
             for s, i in enumerate(order_idx)
         ],
-        # Provisional linear estimate (replaced by simulation after both sides processed)
+        # Provisional linear estimate (replaced by MC simulation when both lineups available)
         "expected_runs_per_game": round(
-            sum(float(players9[i].prob_vector @ RUN_VALUES) for i in order_idx) / 9 * 27, 2
+            sum(float(players9[i].prob_vector @ RUN_VALUES) for i in order_idx)
+            / 9 * 27 * _MC_RUNS_SCALE, 2
         ),
         # Pitcher context (FIP and secondary rates — informational, not fed to model)
         "opp_pitcher_stats": pitcher_fip_ctx,

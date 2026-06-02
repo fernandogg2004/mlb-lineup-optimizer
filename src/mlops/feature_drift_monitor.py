@@ -213,7 +213,9 @@ class DriftMonitor:
             DriftReport with per-feature PSI values and overall recommendation.
         """
         if reference_seasons is None:
-            reference_seasons = [2022, 2023]
+            # Últimas 2 temporadas completas disponibles — se actualiza automáticamente cada año
+            current_year = date.today().year
+            reference_seasons = [current_year - 2, current_year - 1]
 
         cutoff = date.today() - timedelta(days=recent_days)
         report = DriftReport(

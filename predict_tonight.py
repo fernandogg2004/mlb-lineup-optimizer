@@ -180,6 +180,22 @@ def _check_silver_staleness(silver: pl.DataFrame, game_date: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Park factors
+# ---------------------------------------------------------------------------
+
+def _get_park_factors(game: dict) -> tuple[float, float]:
+    """Returns (park_factor_hr, park_factor_xb) for the game venue.
+
+    Looks up the venue ID in src.constants.PARK_FACTORS. Falls back to
+    (1.0, 1.0) for any unlisted venue (neutral assumption).
+    """
+    from src.constants import PARK_FACTORS
+    venue_id = str(game.get("venue", {}).get("id", ""))
+    pf = PARK_FACTORS.get(venue_id, {})
+    return pf.get("hr", 1.0), pf.get("xb", 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Feature computation (replicates training pipeline from features_rolling.py)
 # ---------------------------------------------------------------------------
 
@@ -625,6 +641,7 @@ def _predict_one_side(
         return None
 
     results = []
+    low_data_batters: list[str] = []   # acumula nombres con datos insuficientes
     for slot, player in enumerate(lineup, 1):
         pid  = player["id"]
         name = player["fullName"]
@@ -638,6 +655,11 @@ def _predict_one_side(
         iso_s  = float(X[fcols.index("iso_stabilized")])  if "iso_stabilized"  in fcols else _LEAGUE_AVG["iso"]
         obp_e  = min(woba_s / 0.87 + 0.04, 0.450) if woba_s > 0.01 else 0.330
         in_hist = silver.filter(pl.col("batter_id") == pid).height > 0
+
+        # Detectar bateadores con datos insuficientes (rookies o muy poca historia)
+        pa_30d = float(X[fcols.index("pa_30d")]) if "pa_30d" in fcols else 0.0
+        if not in_hist or pa_30d < 30:
+            low_data_batters.append(name)
 
         if verbose:
             tag = "" if in_hist else " [nuevo]"
@@ -716,6 +738,17 @@ def _predict_one_side(
         ),
         # Pitcher context (FIP and secondary rates — informational, not fed to model)
         "opp_pitcher_stats": pitcher_fip_ctx,
+        # Data quality flags — indicate prediction confidence to the dashboard
+        "data_quality": {
+            "low_data_batters":    low_data_batters,
+            "pitcher_fip_estimated": pitcher_fip_ctx.get("fip_is_estimated", True),
+            "pitcher_fip_weight":    pitcher_fip_ctx.get("fip_data_weight", 0.0),
+            "confidence": (
+                "high"   if not low_data_batters and not pitcher_fip_ctx.get("fip_is_estimated") else
+                "medium" if len(low_data_batters) <= 2 else
+                "low"
+            ),
+        },
         # Internal field for Monte Carlo — caller must pop before saving JSON
         "_lineup_probs_matrix": lineup_probs_matrix,
     }
@@ -799,14 +832,19 @@ def main() -> None:
                     side_results[side] = result
 
             # Run Monte Carlo simulation when both lineups are available
+            pf_hr, pf_xb = _get_park_factors(game)
             if not args.no_sim and len(side_results) == 2:
                 print(f"\n  Simulando partido ({args.n_sims:,} juegos Monte Carlo)...")
                 away_probs = side_results["away"].pop("_lineup_probs_matrix")
                 home_probs = side_results["home"].pop("_lineup_probs_matrix")
 
                 sim_away = _run_game_simulation(away_probs, home_probs,
+                                                park_factor_hr=pf_hr,
+                                                park_factor_xb=pf_xb,
                                                 n_sims=args.n_sims)
                 sim_home = _run_game_simulation(home_probs, away_probs,
+                                                park_factor_hr=pf_hr,
+                                                park_factor_xb=pf_xb,
                                                 n_sims=args.n_sims)
                 side_results["away"].update(sim_away)
                 side_results["home"].update(sim_home)
@@ -823,6 +861,8 @@ def main() -> None:
                 side = next(iter(side_results))
                 my_probs = side_results[side].pop("_lineup_probs_matrix")
                 sim = _run_game_simulation(my_probs, _LEAGUE_AVG_LINEUP,
+                                           park_factor_hr=pf_hr,
+                                           park_factor_xb=pf_xb,
                                            n_sims=args.n_sims)
                 side_results[side].update(sim)
             else:
@@ -912,7 +952,10 @@ def main() -> None:
             opp_probs = opp_result.pop("_lineup_probs_matrix")
         else:
             opp_probs = _LEAGUE_AVG_LINEUP
-        sim = _run_game_simulation(my_probs, opp_probs, n_sims=args.n_sims)
+        pf_hr, pf_xb = _get_park_factors(game)
+        sim = _run_game_simulation(my_probs, opp_probs,
+                                   park_factor_hr=pf_hr, park_factor_xb=pf_xb,
+                                   n_sims=args.n_sims)
         result.update(sim)
         print(f"  E[R]={sim['expected_runs_per_game']}  "
               f"P(W)={sim['win_probability']:.1%}  "

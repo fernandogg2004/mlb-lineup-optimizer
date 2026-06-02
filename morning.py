@@ -269,7 +269,7 @@ def _run_weekly_drift_check() -> None:
     try:
         from src.mlops.feature_drift_monitor import DriftMonitor
         monitor = DriftMonitor(silver_dir=str(ROOT / "data" / "silver" / "plate_appearances"))
-        report  = monitor.run(reference_seasons=[2022, 2023], recent_days=30)
+        report  = monitor.run(recent_days=30)  # reference_seasons dinamico: [year-2, year-1]
         monitor.print_summary(report)
         out = drift_dir / f"drift_{today_dt}.json"
         out.write_text(
@@ -279,6 +279,90 @@ def _run_weekly_drift_check() -> None:
         print(f"  Reporte drift guardado: {out.resolve()}\n")
     except Exception as exc:
         print(f"  [AVISO] Drift monitor no ejecutado: {exc}\n")
+
+
+# ---------------------------------------------------------------------------
+# 2c. Auto-calibración de _MC_RUNS_SCALE (semanal, los lunes)
+# ---------------------------------------------------------------------------
+
+def _recalibrate_mc_scale() -> None:
+    """Recalcula _MC_RUNS_SCALE leyendo todos los comparison JSONs acumulados.
+
+    Solo actúa los lunes y solo si hay >= 30 observaciones (equipo-juego).
+    Actualiza la constante en predict_tonight.py si el nuevo scale difiere
+    más de 0.02 del actual. Protección: el scale nunca sale de [0.60, 0.95].
+    """
+    today_dt = date.today()
+    if today_dt.weekday() != 0:   # solo lunes
+        return
+
+    print(f"{SEP}")
+    print("  AUTO-CALIBRACION _MC_RUNS_SCALE")
+    print(SEP)
+
+    comp_dir = ROOT / "reports" / "comparison"
+    all_comp  = list(comp_dir.glob("*/comparison.json")) + list(comp_dir.glob("comparison_*.json"))
+
+    predicted, actual = [], []
+    for cp in all_comp:
+        try:
+            data = json.loads(cp.read_text(encoding="utf-8"))
+            for g in data.get("games", []):
+                act = g.get("actual", {})
+                ar  = act.get("away_runs")
+                hr  = act.get("home_runs")
+                if ar is None or hr is None:
+                    continue
+                for pred in g.get("predictions", []):
+                    er = pred.get("expected_runs_per_game")
+                    if er is None:
+                        continue
+                    side  = pred.get("side", "")
+                    real  = ar if side == "away" else hr
+                    predicted.append(float(er))
+                    actual.append(float(real))
+        except Exception:
+            pass
+
+    n = len(predicted)
+    if n < 30:
+        print(f"  Insuficientes observaciones: {n} (necesarias >= 30). Saltando.\n")
+        return
+
+    import numpy as np
+
+    # Leer scale actual de predict_tonight.py
+    pt_path = ROOT / "predict_tonight.py"
+    src     = pt_path.read_text(encoding="utf-8")
+    import re
+    m = re.search(r"_MC_RUNS_SCALE:\s*float\s*=\s*([\d.]+)", src)
+    current_scale = float(m.group(1)) if m else 0.768
+
+    # raw MC = predicho / scale_actual
+    raw_mc_mean  = float(np.mean(predicted)) / current_scale
+    actual_mean  = float(np.mean(actual))
+    new_scale    = actual_mean / raw_mc_mean
+    new_scale    = float(max(0.60, min(0.95, new_scale)))   # cap de seguridad
+
+    print(f"  N observaciones  : {n}")
+    print(f"  E[R] predicho    : {np.mean(predicted):.3f}  (raw MC: {raw_mc_mean:.3f})")
+    print(f"  E[R] real        : {actual_mean:.3f}")
+    print(f"  Scale actual     : {current_scale:.4f}")
+    print(f"  Nuevo scale calc : {new_scale:.4f}")
+
+    if abs(new_scale - current_scale) < 0.02:
+        print(f"  Diferencia < 0.02 — sin cambios.\n")
+        return
+
+    # Actualizar la línea en predict_tonight.py
+    new_src = re.sub(
+        r"(_MC_RUNS_SCALE:\s*float\s*=\s*)[\d.]+",
+        lambda _m: f"{_m.group(1)}{new_scale:.4f}",
+        src,
+    )
+    pt_path.write_text(new_src, encoding="utf-8")
+    print(f"  _MC_RUNS_SCALE actualizado: {current_scale:.4f} -> {new_scale:.4f} "
+          f"(guardado en predict_tonight.py)\n")
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +419,9 @@ def main() -> None:
 
     # Weekly feature drift check (every Monday or when no check ran this week)
     _run_weekly_drift_check()
+
+    # Weekly MC scale recalibration (every Monday, requires >= 30 observations)
+    _recalibrate_mc_scale()
 
     if not args.no_predict:
         run_predictions(today)

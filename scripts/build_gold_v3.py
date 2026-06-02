@@ -42,8 +42,11 @@ GIDP_EVENTS = {"grounded_into_double_play", "strikeout_double_play", "double_pla
 # Seasons where raw Statcast is available (for GIDP + pitch_count)
 RAW_SEASONS = {2021, 2022, 2023, 2024}
 
-# Default pitch count imputation for seasons without raw data
-PITCH_COUNT_IMPUTE = 4.0
+# Pitch count imputation: calculado por temporada desde datos reales (RAW_SEASONS).
+# Pre-RAW seasons usan el valor de la primera temporada RAW disponible como proxy.
+# Se rellena en build() tras cargar Silver; el fallback es 4.0 (mediana global).
+PITCH_COUNT_IMPUTE: float = 4.0        # fallback global si Silver no disponible
+_PC_IMPUTE_BY_SEASON: dict[int, float] = {}   # rellenado en compute_pitch_count_imputes()
 
 # Stabilization thresholds and league priors — imported from central constants.
 from src.constants import STAB_T as STABILIZE_T, LEAGUE_AVG as _LEAGUE_PRIORS_RAW  # noqa: E402
@@ -174,6 +177,53 @@ def build_raw_pa_table(season: int) -> pl.DataFrame:
 # Step 3 — Join raw augmentation into Silver
 # ──────────────────────────────────────────────────────────────────────────────
 
+def compute_pitch_count_imputes(silver: pl.DataFrame) -> dict[int, float]:
+    """Computes per-season median pitch count from raw Statcast seasons.
+
+    Pre-RAW seasons (2015-2020) receive the median from the earliest RAW season
+    as a proxy — more accurate than the hardcoded global 4.0 fallback.
+
+    Returns a dict mapping season → imputation value.
+    """
+    global _PC_IMPUTE_BY_SEASON, PITCH_COUNT_IMPUTE
+
+    if "pitch_count_in_pa" not in silver.columns or "season" not in silver.columns:
+        return {}
+
+    raw_seasons_in_silver = silver.filter(pl.col("season").is_in(list(RAW_SEASONS)))
+    if raw_seasons_in_silver.is_empty():
+        return {}
+
+    season_medians = (
+        raw_seasons_in_silver
+        .filter(pl.col("pitch_count_in_pa").is_not_null())
+        .group_by("season")
+        .agg(pl.col("pitch_count_in_pa").median().alias("median_pc"))
+        .sort("season")
+    )
+
+    by_season: dict[int, float] = {
+        int(row["season"]): round(float(row["median_pc"]), 2)
+        for row in season_medians.iter_rows(named=True)
+    }
+
+    # Pre-RAW seasons: use the earliest RAW season median as proxy
+    if by_season:
+        proxy = by_season[min(by_season.keys())]
+        all_seasons = silver["season"].unique().to_list()
+        for s in all_seasons:
+            if int(s) not in by_season:
+                by_season[int(s)] = proxy
+
+    _PC_IMPUTE_BY_SEASON = by_season
+    # Update global fallback to the overall median across raw seasons
+    if by_season:
+        PITCH_COUNT_IMPUTE = round(float(sum(by_season.values()) / len(by_season)), 2)
+
+    print(f"  Pitch count imputes: {dict(sorted(by_season.items()))}")
+    return by_season
+
+
 def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
     """Add is_gidp and pitch_count_in_pa to the Silver DataFrame.
 
@@ -230,7 +280,17 @@ def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
                 pl.col("pa_result").is_in(gidp_events_set)
             )
             .alias("is_gidp"),
-        pl.col("pitch_count_raw").fill_null(PITCH_COUNT_IMPUTE).cast(pl.Float32).alias("pitch_count_in_pa"),
+        # pitch_count season-specific: usa _PC_IMPUTE_BY_SEASON si disponible,
+        # cae al global PITCH_COUNT_IMPUTE (calculado o fallback 4.0) si no.
+        pl.when(pl.col("pitch_count_raw").is_not_null())
+            .then(pl.col("pitch_count_raw").cast(pl.Float32))
+            .otherwise(
+                pl.col("season").map_elements(
+                    lambda s: float(_PC_IMPUTE_BY_SEASON.get(int(s), PITCH_COUNT_IMPUTE)),
+                    return_dtype=pl.Float32,
+                )
+            )
+            .alias("pitch_count_in_pa"),
     ]).drop(["is_gidp_raw", "pitch_count_raw"])
 
     print(f"Augmentation done  GIDP rows: {silver['is_gidp'].sum():,}  [{time.time()-t0:.1f}s]")
@@ -680,6 +740,7 @@ def build(output_path: Path) -> None:
     # ── 2/3. Augment with raw (GIDP + pitch_count) ──────────────────────────
     print("\n=== Step 2: Augment with raw Statcast ===")
     silver = augment_silver(silver)
+    compute_pitch_count_imputes(silver)
 
     # ── 4. Remap labels to 8 classes ────────────────────────────────────────
     print("\n=== Step 3: Remap labels (8 classes) ===")

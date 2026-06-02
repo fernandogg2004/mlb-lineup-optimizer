@@ -67,30 +67,33 @@ class PitcherFIPResult:
     """FIP and derived sabermetric rates for one pitcher.
 
     Attributes:
-        pitcher_id: MLB pitcher identifier.
-        fip:        Fielding Independent Pitching (ERA-scale).
-        ip:         Innings pitched in the sample.
-        k9:         Strikeouts per 9 innings.
-        bb9:        Walks + HBP per 9 innings.
-        hr9:        Home runs per 9 innings.
-        k_pct:      Strikeout rate (K / PA).
-        bb_pct:     Walk+HBP rate (BB+HBP / PA).
-        hr_pct:     Home run rate (HR / PA).
-        n_pa:       Total plate appearances in the sample.
-        is_neutral: True when n_pa < min_pa_threshold — values are league-average.
+        pitcher_id:  MLB pitcher identifier.
+        fip:         Fielding Independent Pitching (ERA-scale), shrunk toward
+                     league average when n_pa < FIP_MIN_PA.
+        ip:          Innings pitched in the sample.
+        k9:          Strikeouts per 9 innings (shrunk).
+        bb9:         Walks + HBP per 9 innings (shrunk).
+        hr9:         Home runs per 9 innings (shrunk).
+        k_pct:       Strikeout rate (K / PA, shrunk).
+        bb_pct:      Walk+HBP rate (BB+HBP / PA, shrunk).
+        hr_pct:      Home run rate (HR / PA, shrunk).
+        n_pa:        Total plate appearances in the sample.
+        is_neutral:  True only when n_pa < 5 (hard minimum — no data at all).
+        data_weight: Fraction of real data used (0.0–1.0). 1.0 = full confidence.
     """
 
-    pitcher_id: int
-    fip:        float
-    ip:         float
-    k9:         float
-    bb9:        float
-    hr9:        float
-    k_pct:      float
-    bb_pct:     float
-    hr_pct:     float
-    n_pa:       int
-    is_neutral: bool
+    pitcher_id:  int
+    fip:         float
+    ip:          float
+    k9:          float
+    bb9:         float
+    hr9:         float
+    k_pct:       float
+    bb_pct:      float
+    hr_pct:      float
+    n_pa:        int
+    is_neutral:  bool
+    data_weight: float = 1.0   # shrinkage weight: n_pa / FIP_MIN_PA, capped at 1.0
 
 
 def compute_pitcher_fip(
@@ -98,28 +101,39 @@ def compute_pitcher_fip(
     silver: pl.DataFrame,
     n_games: int = 30,
     cfip: float = _CFIP_DEFAULT,
-    min_pa: int = 50,
+    min_pa: int = FIP_MIN_PA,
 ) -> PitcherFIPResult:
     """Computes rolling FIP for a pitcher from Silver plate-appearance data.
+
+    Uses gradual shrinkage toward league-average when PA count is below min_pa,
+    eliminating the cliff-edge that previously returned neutral=4.20 for any
+    pitcher with < 50 PA regardless of actual performance.
+
+    Shrinkage weight = min(n_pa / min_pa, 1.0):
+      - n_pa=0   → pure league average (is_neutral=True)
+      - n_pa=25  → 50% real, 50% league avg (data_weight=0.5)
+      - n_pa≥50  → 100% real data (data_weight=1.0)
 
     Args:
         pitcher_id: MLB pitcher identifier.
         silver:     Full Silver DataFrame (all seasons, all pitchers).
         n_games:    Number of most-recent game appearances to include.
-                    Uses game-count windows (consistent with batter rolling features).
-        cfip:       FIP constant (default 3.10 for 2015-2024 MLB).
-        min_pa:     Minimum PAs required to return real values.
-                    Below this threshold, returns neutral league-average FIP.
+        cfip:       FIP constant (default from src.constants.FIP_CONSTANT).
+        min_pa:     PA count for full confidence (default FIP_MIN_PA=50).
+                    Below this, values are shrunk toward league average.
 
     Returns:
         PitcherFIPResult with FIP and secondary rate stats.
     """
+    _la = _LEAGUE_AVG_FIP   # league average priors
     neutral = PitcherFIPResult(
         pitcher_id=pitcher_id,
         fip=_FIP_NEUTRAL, ip=0.0,
-        k9=7.5, bb9=3.0, hr9=1.2,
-        k_pct=0.224, bb_pct=0.083, hr_pct=0.033,
-        n_pa=0, is_neutral=True,
+        k9=round(_la["k_rate"] * 27, 2),
+        bb9=round(_la["bb_rate"] * 27, 2),
+        hr9=0.9,
+        k_pct=_la["k_rate"], bb_pct=_la["bb_rate"], hr_pct=0.033,
+        n_pa=0, is_neutral=True, data_weight=0.0,
     )
 
     if "pitcher_id" not in silver.columns or "pa_outcome_int" not in silver.columns:
@@ -141,7 +155,9 @@ def compute_pitcher_fip(
         rows = rows.filter(pl.col("game_date").is_in(game_dates))
 
     n_pa = len(rows)
-    if n_pa < min_pa:
+
+    # Hard minimum: fewer than 5 PA → no signal at all, return pure neutral
+    if n_pa < 5:
         return neutral
 
     outcomes = rows["pa_outcome_int"]
@@ -155,25 +171,37 @@ def compute_pitcher_fip(
     ip = total_outs / 3.0
 
     if ip < 1.0:
+        neutral.n_pa = n_pa
         return neutral
 
+    # Gradual shrinkage: weight blends real data toward league average
+    w = min(n_pa / min_pa, 1.0)   # 0.0 → 1.0 as n_pa grows to min_pa
+
     raw_fip = (13 * n_hr + 3 * n_bb - 2 * n_k) / ip
-    fip = float(raw_fip + cfip)
-    fip = float(max(_FIP_FLOOR, min(_FIP_CEIL, fip)))
+    fip_real = float(max(_FIP_FLOOR, min(_FIP_CEIL, raw_fip + cfip)))
+    fip = w * fip_real + (1 - w) * _FIP_NEUTRAL
+
+    k_pct_real  = n_k  / n_pa
+    bb_pct_real = n_bb / n_pa
+    hr_pct_real = n_hr / n_pa
+    k_pct  = w * k_pct_real  + (1 - w) * _la["k_rate"]
+    bb_pct = w * bb_pct_real + (1 - w) * _la["bb_rate"]
+    hr_pct = w * hr_pct_real + (1 - w) * 0.033
 
     per_nine = 9.0 / ip
     return PitcherFIPResult(
         pitcher_id=pitcher_id,
         fip=round(fip, 2),
         ip=round(ip, 1),
-        k9=round(n_k * per_nine, 2),
-        bb9=round(n_bb * per_nine, 2),
-        hr9=round(n_hr * per_nine, 2),
-        k_pct=round(n_k / n_pa, 4),
-        bb_pct=round(n_bb / n_pa, 4),
-        hr_pct=round(n_hr / n_pa, 4),
+        k9=round(k_pct * 27, 2),
+        bb9=round(bb_pct * 27, 2),
+        hr9=round(hr_pct * 27, 2),
+        k_pct=round(k_pct, 4),
+        bb_pct=round(bb_pct, 4),
+        hr_pct=round(hr_pct, 4),
         n_pa=n_pa,
-        is_neutral=False,
+        is_neutral=(w < 1.0),   # partially shrunk counts as not fully real
+        data_weight=round(w, 3),
     )
 
 
@@ -202,7 +230,7 @@ def compute_pitcher_fip_for_inference(
         return {
             "fip": _FIP_NEUTRAL, "k9": 7.5, "bb9": 3.0, "hr9": 1.2,
             "k_pct": 0.224, "bb_pct": 0.083, "hr_pct": 0.033,
-            "fip_sample_pa": 0, "fip_is_estimated": True,
+            "fip_sample_pa": 0, "fip_is_estimated": True, "fip_data_weight": 0.0,
         }
     result = compute_pitcher_fip(pitcher_id, silver, n_games=n_games)
     return {
@@ -215,4 +243,5 @@ def compute_pitcher_fip_for_inference(
         "hr_pct":           result.hr_pct,
         "fip_sample_pa":    result.n_pa,
         "fip_is_estimated": result.is_neutral,
+        "fip_data_weight":  result.data_weight,
     }

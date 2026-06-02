@@ -1,8 +1,8 @@
 """
-train_v3.py — Train AtBatPredictor v4 on full Statcast era (2015-2025 + 2026 partial).
+train_v3.py — Train AtBatPredictor v4 on full Statcast era (2015-present).
 
 Changes vs v3:
-  - VAL_SEASON = 2025 (modelo ve datos 2025 por primera vez)
+  - VAL_SEASON dinámico: siempre la temporada anterior al año actual
   - LOG_SCALED_CLASS_WEIGHTS para mejorar recall en eventos raros (3B, DP, HR)
   - Calibration split correcto: val_df partido en dos mitades cronológicas
     (primera mitad → calibración isotónica, segunda mitad → early stopping + ECE)
@@ -13,6 +13,7 @@ from __future__ import annotations
 import shutil
 import sys
 import time
+from datetime import date as _date
 from pathlib import Path
 
 import numpy as np
@@ -32,11 +33,11 @@ GOLD_PATH  = ROOT / "data" / "gold" / "features_train_v3.parquet"
 OUT_PATH   = ROOT / "models" / "pa_predictor_v1.pkl"
 DEST_PATH  = ROOT / "models" / "at_bat_predictor.pkl"
 
-# 2025 = primera temporada post-entrenamiento anterior → es el holdout real
-VAL_SEASON  = 2025
-# 2026 parcial: incluir en entrenamiento para que el modelo vea datos actuales
-# (pocas filas, no usarlo como val porque la temporada no ha terminado)
-TRAIN_CAP_SEASON = 2026
+# VAL_SEASON dinámico: siempre la temporada anterior al año actual.
+# Esto garantiza que el retrain anual siempre valida en el año más reciente completo
+# sin necesidad de actualización manual.
+VAL_SEASON       = _date.today().year - 1
+TRAIN_CAP_SEASON = _date.today().year   # temporada actual (parcial) incluida en train
 
 _LEAKING    = {"xwoba", "launch_speed", "launch_angle"}
 SAMPLE_FRAC = 0.70   # aumentado a 0.70 porque ahora hay ~12 temporadas
@@ -66,9 +67,11 @@ def main() -> None:
     val_df   = df.filter(pl.col("season") == VAL_SEASON).sort("game_date")
 
     if val_df.is_empty():
-        print(f"ERROR: No hay datos para VAL_SEASON={VAL_SEASON}. "
-              "¿Se descargó Silver 2025?", flush=True)
-        sys.exit(1)
+        # Si VAL_SEASON no tiene datos (temporada aún sin empezar), usar el más reciente disponible
+        fallback = max(s for s in seasons_available if s < VAL_SEASON)
+        print(f"AVISO: VAL_SEASON={VAL_SEASON} sin datos. Usando {fallback} como fallback.", flush=True)
+        val_df   = df.filter(pl.col("season") == fallback).sort("game_date")
+        train_df = df.filter(pl.col("season") != fallback)
 
     # Calibration split: primera mitad cronológica → calibración
     #                    segunda mitad → early stopping + holdout ECE

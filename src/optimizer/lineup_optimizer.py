@@ -147,6 +147,7 @@ class GAConfig:
     seed: int = 42
     mlflow_experiment: str = "lineup-optimizer"
     n_sabermetric_seeds: int = 50
+    bullpen_weight: float = 0.40   # fracción del partido cubierta por bullpen (innings 6-9 ≈ 40%)
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +424,7 @@ class GeneticLineupOptimizer:
         simulation_engine,           # MonteCarloEngine (typed as Any to avoid circular import)
         opp_lineup_probs: np.ndarray,
         config: Optional[GAConfig] = None,
+        opp_bullpen_probs: Optional[np.ndarray] = None,
     ) -> None:
         """Initializes the optimizer.
 
@@ -430,8 +432,11 @@ class GeneticLineupOptimizer:
             players: Exactly 9 ``PlayerStats`` for the active lineup.
             lineup_probs: Probability matrix shape (9, 7). Row order matches ``players``.
             simulation_engine: ``MonteCarloEngine`` instance from simulation_engine.py.
-            opp_lineup_probs: Opponent's probability matrix, shape (9, 7).
+            opp_lineup_probs: Opponent starter probability matrix, shape (9, 7).
             config: GA configuration; uses defaults if not provided.
+            opp_bullpen_probs: Optional opponent bullpen probability matrix, shape (9, 7).
+                When provided, fitness = (1-bullpen_weight)*starter_ev + bullpen_weight*bullpen_ev.
+                Falls back to opp_lineup_probs (starter) if None.
 
         Raises:
             ValueError: If player count != 9 or probability shapes are wrong.
@@ -446,6 +451,11 @@ class GeneticLineupOptimizer:
         self.players          = players
         self.lineup_probs     = lineup_probs.astype(np.float32)
         self.opp_lineup_probs = opp_lineup_probs.astype(np.float32)
+        self.opp_bullpen_probs = (
+            opp_bullpen_probs.astype(np.float32)
+            if opp_bullpen_probs is not None
+            else None
+        )
         self.sim              = simulation_engine
         self.config           = config or GAConfig()
         self._seeder          = SabermetricSeeder(players)
@@ -535,7 +545,15 @@ class GeneticLineupOptimizer:
             Tuple ``(expected_runs,)`` (DEAP requires a tuple return).
         """
         ordered_probs = self.lineup_probs[individual].astype(np.float32)
-        er = self.sim.run_fast(ordered_probs, self.opp_lineup_probs)
+        starter_er = self.sim.run_fast(ordered_probs, self.opp_lineup_probs)
+
+        if self.opp_bullpen_probs is not None:
+            bw = self.config.bullpen_weight
+            bullpen_er = self.sim.run_fast(ordered_probs, self.opp_bullpen_probs)
+            er = (1 - bw) * starter_er + bw * bullpen_er
+        else:
+            er = starter_er
+
         self._n_evals += 1
         return (er,)
 

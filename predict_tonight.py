@@ -54,12 +54,13 @@ RUN_VALUES    = np.array([0.0, 0.0, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43],
                           dtype=np.float32)
 
 # Post-hoc calibration scale for Monte Carlo E[R/game] output.
-# The model (trained with LOG_SCALED_CLASS_WEIGHTS) inflates hit probabilities,
-# causing the MC to predict ~5.07 runs/team when the MLB 2025-26 average is ~4.5.
-# Empirical: comparison_2026-05-27.json → predicted mean=5.07, actual mean=3.67 (15 games).
-# Conservative estimate uses MLB season average as target: 4.5 / 5.07 = 0.888.
-# Update this constant as more game results accumulate.
-_MC_RUNS_SCALE: float = 0.888
+# The model (trained with LOG_SCALED_CLASS_WEIGHTS + FIP features) inflates hit
+# probabilities causing MC to predict ~5.86 runs/team vs MLB 2025-26 avg ~4.5.
+# Calibrated on 2026-06-02 (30 teams, current-day probable pitchers):
+#   raw MC mean = 5.857  →  target 4.5 / 5.857 = 0.768
+# Comparison 2026-05-27 (15 games): actual mean=3.67, raw pred=5.07 (old model).
+# Update this constant as more game results accumulate in reports/comparison/.
+_MC_RUNS_SCALE: float = 0.768
 
 MODEL_PATH = ROOT / "models" / "at_bat_predictor.pkl"
 SILVER_DIR = ROOT / "data" / "silver" / "plate_appearances"

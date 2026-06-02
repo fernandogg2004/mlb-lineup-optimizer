@@ -816,9 +816,9 @@ async def get_optimize(
     """
     Lineup óptimo calculado en tiempo real — sin PostgreSQL.
     Usa el modelo y Silver ya cargados en memoria al arrancar uvicorn.
-    Limitado a 2 peticiones/min por IP (el cálculo GA puede tardar 3-30 s).
+    Limitado a 10 peticiones/min por IP.
     """
-    _rate_limit(request, max_calls=2, window_secs=60)
+    _rate_limit(request, max_calls=10, window_secs=60)
 
     import requests as _req
     from predict_tonight import _predict_one_side

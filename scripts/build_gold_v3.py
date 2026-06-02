@@ -67,14 +67,18 @@ LEAGUE_PRIORS = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_silver_all() -> pl.DataFrame:
-    """Load all Silver plate_appearances (2015-2024) into one DataFrame."""
+    """Load all available Silver plate_appearances into one DataFrame."""
     t0 = time.time()
     frames = []
-    for season in range(2015, 2025):
+    # Auto-detect available seasons from directory structure
+    available_seasons = sorted(
+        int(p.name.replace("season=", ""))
+        for p in SILVER_ROOT.glob("season=*")
+        if (p / "data.parquet").exists()
+    )
+    print(f"  Seasons found: {available_seasons}")
+    for season in available_seasons:
         path = SILVER_ROOT / f"season={season}" / "data.parquet"
-        if not path.exists():
-            print(f"  [WARN] Silver {season} not found, skipping")
-            continue
         df = pl.read_parquet(path, hive_partitioning=False)
         # Ensure season column is present
         if "season" not in df.columns:
@@ -220,9 +224,16 @@ def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
             pl.lit(None).cast(pl.Int32).alias("pitch_count_raw"),
         ])
 
-    # Materialise is_gidp and pitch_count_in_pa with defaults for missing rows
+    # Materialise is_gidp: raw Statcast join takes priority; fall back to
+    # pa_result string for seasons without raw Statcast (2015-2020, 2025-2026).
+    gidp_events_set = list(GIDP_EVENTS)
     silver = silver.with_columns([
-        pl.col("is_gidp_raw").fill_null(False).alias("is_gidp"),
+        pl.when(pl.col("is_gidp_raw").is_not_null())
+            .then(pl.col("is_gidp_raw"))
+            .otherwise(
+                pl.col("pa_result").is_in(gidp_events_set)
+            )
+            .alias("is_gidp"),
         pl.col("pitch_count_raw").fill_null(PITCH_COUNT_IMPUTE).cast(pl.Float32).alias("pitch_count_in_pa"),
     ]).drop(["is_gidp_raw", "pitch_count_raw"])
 

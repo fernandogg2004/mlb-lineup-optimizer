@@ -125,6 +125,24 @@ RUN_VALUES: np.ndarray = np.array(
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Log-scaled class weights for the 8-outcome PA model.
+# Rationale: "balanced" mode produces a 128:1 weight ratio that destabilizes
+# LightGBM (best_iteration collapses to 1). These log-scaled weights apply
+# moderate pressure on rare events (3B ~0.8%, DP ~1.5%) without causing
+# training instability. Verified empirically on 2015-2024 Silver data.
+# To disable rebalancing entirely, set class_weight=None in AtBatModelConfig.
+LOG_SCALED_CLASS_WEIGHTS: dict[int, float] = {
+    0: 1.0,   # OUT_IN_PLAY  ~45%
+    1: 1.2,   # STRIKEOUT    ~22%
+    2: 2.5,   # WALK_HBP     ~9%
+    3: 2.0,   # SINGLE       ~15%
+    4: 3.5,   # DOUBLE       ~5%
+    5: 12.0,  # TRIPLE       ~0.8%
+    6: 4.0,   # HOME_RUN     ~3.2%
+    7: 5.0,   # DOUBLE_PLAY  ~1.5%
+}
+
+
 @dataclass
 class AtBatModelConfig:
     """Hyperparameters and training settings for the PA-level model.
@@ -139,8 +157,10 @@ class AtBatModelConfig:
         colsample_bytree: Feature sub-sampling ratio per tree.
         reg_alpha: L1 regularization term.
         reg_lambda: L2 regularization term.
-        class_weight: Rebalancing strategy for minority outcomes
-            (HR, 3B, 2B are rare vs. OUT). ``"balanced"`` or ``None``.
+        class_weight: Per-class weight dict, ``"balanced"``, or ``None``.
+            Defaults to ``LOG_SCALED_CLASS_WEIGHTS``, which applies moderate
+            upweighting to rare events (3B, DP, HR) without the 128:1 ratio
+            instability caused by ``"balanced"``.  Pass ``None`` to disable.
         calibration_method: ``"isotonic"`` or ``"sigmoid"`` (Platt).
         ece_n_bins: Number of equal-width confidence bins for ECE.
         ece_target: Acceptable ECE threshold; warning if exceeded.
@@ -161,11 +181,7 @@ class AtBatModelConfig:
     reg_alpha: float = 0.10
     reg_lambda: float = 1.50
     max_bin: int = 255
-    # class_weight: "balanced" with 8 classes at 0.78%–45% creates a 128:1
-    # weight ratio that destabilizes LightGBM training (best_iteration=1).
-    # Using None (unweighted) + isotonic calibration achieves the same ECE goal
-    # without training instability. Can revisit with manual log-scaled weights.
-    class_weight: Optional[str] = None
+    class_weight: Optional[dict | str] = None  # set to LOG_SCALED_CLASS_WEIGHTS at retrain
     calibration_method: str = "isotonic"
     ece_n_bins: int = 10
     ece_target: float = 0.035
@@ -1080,7 +1096,10 @@ def main(argv: list[str] | None = None) -> None:
         X_val = val_df_sorted[mid:].select(feature_cols).to_numpy().astype(np.float32)
         y_val = val_df_sorted[mid:][label_col].to_numpy().astype(np.int32)
 
-        config = AtBatModelConfig(mlflow_experiment=args.experiment)
+        config = AtBatModelConfig(
+            mlflow_experiment=args.experiment,
+            class_weight=LOG_SCALED_CLASS_WEIGHTS,
+        )
         predictor = AtBatPredictor(config)
         predictor.fit(
             X_train, y_train,

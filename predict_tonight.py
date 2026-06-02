@@ -20,7 +20,7 @@ import argparse
 import json
 import pickle
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -46,8 +46,12 @@ from src.optimizer.lineup_optimizer import PlayerStats, SabermetricSeeder  # noq
 # ---------------------------------------------------------------------------
 MLB_API = "https://statsapi.mlb.com/api/v1"
 
-OUTCOME_NAMES = ["OUT", "K", "BB/HBP", "1B", "2B", "3B", "HR"]
-RUN_VALUES    = np.array([0.0, 0.0, 0.33, 0.47, 0.75, 1.03, 1.40], dtype=np.float32)
+# 8-class outcome names and run values (must match model_at_bat.PAOutcome)
+#   0=OUT_IN_PLAY  1=STRIKEOUT  2=WALK_HBP  3=SINGLE  4=DOUBLE
+#   5=TRIPLE       6=HOME_RUN   7=DOUBLE_PLAY (GIDP)
+OUTCOME_NAMES = ["OUT", "K", "BB/HBP", "1B", "2B", "3B", "HR", "DP"]
+RUN_VALUES    = np.array([0.0, 0.0, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43],
+                          dtype=np.float32)
 
 MODEL_PATH = ROOT / "models" / "at_bat_predictor.pkl"
 SILVER_DIR = ROOT / "data" / "silver" / "plate_appearances"
@@ -62,21 +66,27 @@ _LEAGUE_AVG = {
     "iso":     0.147,
 }
 
-# 33 features in Gold column order (must match model training order exactly)
-FEATURE_COLS = [
-    "pa_7d", "k_rate_7d", "bb_rate_7d", "hr_rate_7d", "hard_hit_rate_7d",
-    "xwoba_7d", "launch_speed_7d",
-    "pa_15d", "k_rate_15d", "bb_rate_15d", "hr_rate_15d", "hard_hit_rate_15d",
-    "xwoba_15d", "launch_speed_15d",
-    "pa_30d", "k_rate_30d", "bb_rate_30d", "hr_rate_30d", "hard_hit_rate_30d",
-    "xwoba_30d", "launch_speed_30d",
-    "xwoba_ewma_alpha02", "xwoba_ewma_alpha05",
-    "woba_stabilized", "woba_shrinkage_b",
-    "k_rate_stabilized", "k_rate_shrinkage_b",
-    "bb_rate_stabilized", "bb_rate_shrinkage_b",
-    "babip_stabilized", "babip_shrinkage_b",
-    "iso_stabilized", "iso_shrinkage_b",
-]
+# Pitch-type encoding (must match build_gold_v3.py _PITCH_TYPE_MAP)
+_PITCH_TYPE_ENC = {
+    "FF": 1, "SI": 2, "FC": 3, "SL": 4, "CH": 5,
+    "CU": 6, "KC": 7, "FS": 8, "CS": 9, "ST": 10,
+}
+
+# League-average PA outcome distribution (MLB 2023 rates, 8-class).
+# Used as opponent proxy when only one lineup is available.
+_LEAGUE_AVG_PA_PROBS = np.array(
+    [0.451, 0.223, 0.092, 0.150, 0.050, 0.008, 0.032, 0.010],
+    dtype=np.float32,
+)
+_LEAGUE_AVG_PA_PROBS /= _LEAGUE_AVG_PA_PROBS.sum()
+_LEAGUE_AVG_LINEUP: np.ndarray = np.tile(_LEAGUE_AVG_PA_PROBS, (9, 1))
+
+# FEATURE_COLS is fetched from the model at runtime (see _load_model).
+# This empty sentinel is replaced after the model loads.
+FEATURE_COLS: list[str] = []
+
+# Minimum gap (days) before issuing a data-staleness warning.
+_STALENESS_WARN_DAYS = 90
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +125,65 @@ def fetch_roster(team_id: int) -> list[dict]:
         return []
 
 
+def _fetch_pitcher_hand(pitcher_id: int | None) -> str:
+    """Returns the throwing arm of a pitcher ('R' or 'L') from the MLB Stats API.
+
+    Falls back to 'R' on any error so the pipeline never blocks on an API failure.
+    """
+    if not pitcher_id:
+        return "R"
+    try:
+        data = _api_get(f"/people/{pitcher_id}")
+        code = (
+            data.get("people", [{}])[0]
+                .get("pitchHand", {})
+                .get("code", "R")
+        )
+        return code if code in ("R", "L") else "R"
+    except Exception:
+        return "R"
+
+
+# ---------------------------------------------------------------------------
+# Data-staleness check
+# ---------------------------------------------------------------------------
+
+def _check_silver_staleness(silver: pl.DataFrame, game_date: str) -> None:
+    """Warns when Silver data lags more than _STALENESS_WARN_DAYS behind game_date.
+
+    A large gap means player hot/cold streaks and roster changes from the
+    missing period are invisible to the model — predictions default to
+    career averages for the affected players.
+    """
+    if "game_date" not in silver.columns:
+        return
+    last_raw = silver["game_date"].max()
+    if last_raw is None:
+        return
+    try:
+        pred_dt = date.fromisoformat(game_date)
+        last_dt = last_raw if isinstance(last_raw, date) else last_raw.date()
+        gap_days = (pred_dt - last_dt).days
+    except Exception:
+        return
+
+    if gap_days > _STALENESS_WARN_DAYS:
+        pct_no_recent = (
+            silver.filter(
+                pl.col("game_date") >= pl.lit(str(pred_dt - timedelta(days=90)))
+            ).height == 0
+        )
+        print(
+            f"\n  AVISO: Datos Silver con {gap_days} dias de retraso "
+            f"(ultimo: {last_dt}, prediccion: {game_date})."
+        )
+        print(
+            "    Los jugadores sin datos de 2025+ recibiran valores de "
+            "liga promedio — precision reducida."
+        )
+        print("    Ejecuta: python -m src.ingestion.statcast_ingestion para actualizar.\n")
+
+
 # ---------------------------------------------------------------------------
 # Feature computation (replicates training pipeline from features_rolling.py)
 # ---------------------------------------------------------------------------
@@ -136,42 +205,119 @@ def _stabilize(raw: float, n_pa: int, stat: str) -> tuple[float, float]:
     return float(_LEAGUE_AVG[stat] + (1 - b) * (raw - _LEAGUE_AVG[stat])), float(b)
 
 
-def compute_features(batter_id: int, pitcher_throws: str, silver: pl.DataFrame) -> np.ndarray:
+def compute_features(
+    batter_id: int,
+    pitcher_throws: str,
+    silver: pl.DataFrame,
+    feature_names: list[str] | None = None,
+) -> np.ndarray:
     """
-    Construye el vector de 33 features para un bateador vs un tipo de lanzador.
+    Construye el vector de features para un bateador vs un tipo de lanzador.
 
-    Replica exactamente el pipeline de entrenamiento:
+    Replica exactamente el pipeline de entrenamiento (Gold v3):
       1. _add_pa_event_flags (de features_rolling.py)
       2. _aggregate_to_daily  -> 1 fila por (batter_id, game_date)
       3. Rolling sobre ultimos N JUEGOS (no PAs) sin shift -> stats "as of last known game"
       4. EWMA sobre xwoba_mean diario
       5. Platoon stats (vs pitcher_throws) con shrinkage James-Stein
+      6. Nuevas features (Mejoras 2 y 4): batter_stand, pitcher_throws (enc.),
+         last_pitch_type (=0 pre-partido), pitch_count_in_pa (=4.0 imputed),
+         era_shift_ban, era_universal_dh, era_first_year_shift_ban.
+
+    Args:
+        batter_id:      MLB batter identifier.
+        pitcher_throws: "R" or "L" for the opposing pitcher's handedness.
+        silver:         Silver plate_appearances DataFrame (all seasons).
+        feature_names:  Ordered list from the loaded model (_feature_names).
+                        When None, falls back to the module-level FEATURE_COLS.
     """
     from src.features.features_rolling import _add_pa_event_flags, _aggregate_to_daily
 
+    fcols = feature_names if feature_names is not None else FEATURE_COLS
+
     rows = silver.filter(pl.col("batter_id") == batter_id)
+
+    # ── Derive static features (game-context, not history-dependent) ─────────
+    # batter_stand: switch hitters bat from the opposite side of the pitcher.
+    if not rows.is_empty() and "batter_stand" in rows.columns:
+        stands = set(rows["batter_stand"].drop_nulls().unique().to_list())
+        if len(stands) >= 2:
+            # Switch hitter — bats left vs RHP, right vs LHP
+            batter_stand_enc = 0 if pitcher_throws == "R" else 1
+        else:
+            top = rows["batter_stand"].drop_nulls().mode()[0]
+            batter_stand_enc = 1 if top == "R" else 0
+    else:
+        batter_stand_enc = 1  # default right-handed
+
+    # pitcher_throws: encode R=1, L=0
+    pitcher_throws_enc = 1 if pitcher_throws == "R" else 0
+
+    # last_pitch_type: unknown pre-game → 0 (maps to "unknown" in _PITCH_TYPE_ENC)
+    last_pitch_type_enc = 0
+
+    # pitch_count_in_pa: unknown pre-game → MLB median = 4.0
+    pitch_count_in_pa = 4.0
+
+    # Era encoding: set based on current year (today's season)
+    from datetime import date as _date
+    current_year = _date.today().year
+    era_shift_ban          = 1 if current_year >= 2023 else 0
+    era_universal_dh       = 1 if current_year >= 2020 else 0
+    era_first_year_shift_ban = 1 if current_year == 2023 else 0
+
+    # ── League-average defaults for all rolling/stabilized features ──────────
+    _defaults: dict[str, float] = {
+        # new features
+        "batter_stand":          float(batter_stand_enc),
+        "pitcher_throws":        float(pitcher_throws_enc),
+        "last_pitch_type":       float(last_pitch_type_enc),
+        "pitch_count_in_pa":     pitch_count_in_pa,
+        # era features
+        "era_shift_ban":          float(era_shift_ban),
+        "era_universal_dh":       float(era_universal_dh),
+        "era_first_year_shift_ban": float(era_first_year_shift_ban),
+        # rolling (league avg)
+        "babip_shrinkage_b":      1.0,
+        "babip_stabilized":       _LEAGUE_AVG["babip"],
+        "bb_rate_15d":            _LEAGUE_AVG["bb_rate"],
+        "bb_rate_30d":            _LEAGUE_AVG["bb_rate"],
+        "bb_rate_7d":             _LEAGUE_AVG["bb_rate"],
+        "bb_rate_shrinkage_b":    1.0,
+        "bb_rate_stabilized":     _LEAGUE_AVG["bb_rate"],
+        "hard_hit_rate_15d":      0.35,
+        "hard_hit_rate_30d":      0.35,
+        "hard_hit_rate_7d":       0.35,
+        "hr_rate_15d":            0.033,
+        "hr_rate_30d":            0.033,
+        "hr_rate_7d":             0.033,
+        "iso_shrinkage_b":        1.0,
+        "iso_stabilized":         _LEAGUE_AVG["iso"],
+        "k_rate_15d":             _LEAGUE_AVG["k_rate"],
+        "k_rate_30d":             _LEAGUE_AVG["k_rate"],
+        "k_rate_7d":              _LEAGUE_AVG["k_rate"],
+        "k_rate_shrinkage_b":     1.0,
+        "k_rate_stabilized":      _LEAGUE_AVG["k_rate"],
+        "launch_speed_15d":       88.0,
+        "launch_speed_30d":       88.0,
+        "launch_speed_7d":        88.0,
+        "pa_15d":                 60.0,
+        "pa_30d":                 120.0,
+        "pa_7d":                  28.0,
+        "woba_shrinkage_b":       1.0,
+        "woba_stabilized":        _LEAGUE_AVG["woba"],
+        "xwoba_15d":              0.35,
+        "xwoba_30d":              0.35,
+        "xwoba_7d":               0.35,
+        "xwoba_ewma_alpha02":     0.35,
+        "xwoba_ewma_alpha05":     0.35,
+    }
+
     if rows.is_empty():
         # No history: return league-average features so predictions are neutral
-        league_defaults = {
-            "babip_shrinkage_b": 1.0,   "babip_stabilized": _LEAGUE_AVG["babip"],
-            "bb_rate_15d": _LEAGUE_AVG["bb_rate"],
-            "bb_rate_30d": _LEAGUE_AVG["bb_rate"],
-            "bb_rate_7d":  _LEAGUE_AVG["bb_rate"],
-            "bb_rate_shrinkage_b": 1.0, "bb_rate_stabilized": _LEAGUE_AVG["bb_rate"],
-            "hard_hit_rate_15d": 0.35,  "hard_hit_rate_30d": 0.35, "hard_hit_rate_7d": 0.35,
-            "hr_rate_15d": 0.033,       "hr_rate_30d": 0.033,      "hr_rate_7d": 0.033,
-            "iso_shrinkage_b": 1.0,     "iso_stabilized": _LEAGUE_AVG["iso"],
-            "k_rate_15d": _LEAGUE_AVG["k_rate"],
-            "k_rate_30d": _LEAGUE_AVG["k_rate"],
-            "k_rate_7d":  _LEAGUE_AVG["k_rate"],
-            "k_rate_shrinkage_b": 1.0,  "k_rate_stabilized": _LEAGUE_AVG["k_rate"],
-            "launch_speed_15d": 88.0,   "launch_speed_30d": 88.0,  "launch_speed_7d": 88.0,
-            "pa_15d": 60.0,             "pa_30d": 120.0,            "pa_7d": 28.0,
-            "woba_shrinkage_b": 1.0,    "woba_stabilized": _LEAGUE_AVG["woba"],
-            "xwoba_15d": 0.35,          "xwoba_30d": 0.35,          "xwoba_7d": 0.35,
-            "xwoba_ewma_alpha02": 0.35, "xwoba_ewma_alpha05": 0.35,
-        }
-        return np.array([league_defaults[c] for c in FEATURE_COLS], dtype=np.float32)
+        return np.array(
+            [_defaults.get(c, 0.0) for c in fcols], dtype=np.float32
+        )
 
     # ---- Game-level daily aggregation ----
     daily = _aggregate_to_daily(_add_pa_event_flags(rows.lazy())).collect()
@@ -243,8 +389,20 @@ def compute_features(batter_id: int, pitcher_throws: str, silver: pl.DataFrame) 
         babip_raw  = (hits_p - hr_p) / max(bip_p, 1.0)
         xwoba_vals = platoon_rows["xwoba"].drop_nulls()
         woba_raw   = float(xwoba_vals.mean()) if len(xwoba_vals) > 0 else _LEAGUE_AVG["woba"]
-        # ISO ≈ extra-base power (rough approximation)
-        iso_raw    = max(woba_raw - (hits_p / max(total_pa_p, 1)) * 0.89, 0.0)
+
+        # ISO = (2B + 2*3B + 3*HR) / AB  — standard sabermetric definition
+        # pa_outcome_int encodes: 4=DOUBLE, 5=TRIPLE, 6=HOME_RUN, 2=WALK_HBP
+        if "pa_outcome_int" in platoon_rows.columns:
+            n_2b    = int((platoon_rows["pa_outcome_int"] == 4).sum())
+            n_3b    = int((platoon_rows["pa_outcome_int"] == 5).sum())
+            n_hr_p  = int((platoon_rows["pa_outcome_int"] == 6).sum())
+            n_bb_p  = int((platoon_rows["pa_outcome_int"] == 2).sum())
+            n_ab    = max(int(total_pa_p) - n_bb_p, 1)
+            iso_raw = float(n_2b + 2 * n_3b + 3 * n_hr_p) / n_ab
+        else:
+            # Fallback when outcome encoding is unavailable
+            iso_raw = float(hr_p) * 3.0 / max(float(bip_p), 1.0)
+        iso_raw = max(iso_raw, 0.0)
     else:
         total_pa_p = 0
         k_raw = bb_raw = iso_raw = 0.0
@@ -257,42 +415,38 @@ def compute_features(batter_id: int, pitcher_throws: str, silver: pl.DataFrame) 
     babip_stab,   babip_b   = _stabilize(babip_raw,   int(total_pa_p), "babip")
     iso_stab,     iso_b     = _stabilize(iso_raw,     int(total_pa_p), "iso")
 
-    feat = {
-        "babip_shrinkage_b":   babip_b,
-        "babip_stabilized":    babip_stab,
-        "bb_rate_15d":         bb15,
-        "bb_rate_30d":         bb30,
-        "bb_rate_7d":          bb7,
-        "bb_rate_shrinkage_b": bb_b,
+    # Merge computed values into the defaults dict (overwrite with real values)
+    _defaults.update({
+        "batter_stand":         float(batter_stand_enc),
+        "pitcher_throws":       float(pitcher_throws_enc),
+        "last_pitch_type":      float(last_pitch_type_enc),
+        "pitch_count_in_pa":    pitch_count_in_pa,
+        "era_shift_ban":         float(era_shift_ban),
+        "era_universal_dh":      float(era_universal_dh),
+        "era_first_year_shift_ban": float(era_first_year_shift_ban),
+        # rolling
+        "babip_shrinkage_b":   babip_b,   "babip_stabilized":    babip_stab,
+        "bb_rate_15d":         bb15,       "bb_rate_30d":         bb30,
+        "bb_rate_7d":          bb7,        "bb_rate_shrinkage_b": bb_b,
         "bb_rate_stabilized":  bb_rate_stab,
-        "hard_hit_rate_15d":   hh15,
-        "hard_hit_rate_30d":   hh30,
+        "hard_hit_rate_15d":   hh15,       "hard_hit_rate_30d":   hh30,
         "hard_hit_rate_7d":    hh7,
-        "hr_rate_15d":         hr15,
-        "hr_rate_30d":         hr30,
+        "hr_rate_15d":         hr15,       "hr_rate_30d":         hr30,
         "hr_rate_7d":          hr7,
-        "iso_shrinkage_b":     iso_b,
-        "iso_stabilized":      iso_stab,
-        "k_rate_15d":          k15,
-        "k_rate_30d":          k30,
-        "k_rate_7d":           k7,
-        "k_rate_shrinkage_b":  k_b,
+        "iso_shrinkage_b":     iso_b,      "iso_stabilized":      iso_stab,
+        "k_rate_15d":          k15,        "k_rate_30d":          k30,
+        "k_rate_7d":           k7,         "k_rate_shrinkage_b":  k_b,
         "k_rate_stabilized":   k_rate_stab,
-        "launch_speed_15d":    ls15,
-        "launch_speed_30d":    ls30,
+        "launch_speed_15d":    ls15,       "launch_speed_30d":    ls30,
         "launch_speed_7d":     ls7,
-        "pa_15d":              pa15,
-        "pa_30d":              pa30,
+        "pa_15d":              pa15,       "pa_30d":              pa30,
         "pa_7d":               pa7,
-        "woba_shrinkage_b":    woba_b,
-        "woba_stabilized":     woba_stab,
-        "xwoba_15d":           xw15,
-        "xwoba_30d":           xw30,
+        "woba_shrinkage_b":    woba_b,     "woba_stabilized":     woba_stab,
+        "xwoba_15d":           xw15,       "xwoba_30d":           xw30,
         "xwoba_7d":            xw7,
-        "xwoba_ewma_alpha02":  ewma02,
-        "xwoba_ewma_alpha05":  ewma05,
-    }
-    return np.array([feat[c] for c in FEATURE_COLS], dtype=np.float32)
+        "xwoba_ewma_alpha02":  ewma02,     "xwoba_ewma_alpha05":  ewma05,
+    })
+    return np.array([_defaults.get(c, 0.0) for c in fcols], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -324,18 +478,93 @@ def _print_optimal_order(order: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Monte Carlo simulation helper
+# ---------------------------------------------------------------------------
+
+def _run_game_simulation(
+    my_lineup_probs: np.ndarray,
+    opp_lineup_probs: np.ndarray,
+    park_factor_hr: float = 1.0,
+    park_factor_xb: float = 1.0,
+    n_sims: int = 10_000,
+) -> dict:
+    """Runs a Monte Carlo simulation for one team vs. opponent.
+
+    Uses the Numba-parallel engine (no Ray required). With 10k simulations
+    the standard error on E[R] is < 0.03 runs — sufficient for game-day
+    decisions. Set n_sims=50_000 for tighter percentile estimates.
+
+    Args:
+        my_lineup_probs:  Shape (9, 8) float32 — my batting order.
+        opp_lineup_probs: Shape (9, 8) float32 — opponent batting order
+                          (use _LEAGUE_AVG_LINEUP when opponent is unknown).
+        park_factor_hr:   HR park factor (1.0 = neutral).
+        park_factor_xb:   Extra-base hit park factor (1.0 = neutral).
+        n_sims:           Number of games to simulate.
+
+    Returns:
+        Dict with simulation statistics ready to merge into the result JSON.
+    """
+    from src.simulation.simulation_engine import MonteCarloConfig, MonteCarloEngine
+
+    cfg = MonteCarloConfig(
+        n_simulations=n_sims,
+        use_ray=False,
+        park_factor_hr=park_factor_hr,
+        park_factor_xb=park_factor_xb,
+        use_extra_innings=False,
+    )
+    engine = MonteCarloEngine(cfg)
+    sim = engine.run(my_lineup_probs.astype(np.float32),
+                     opp_lineup_probs.astype(np.float32))
+
+    pct = sim.runs_scored_percentiles
+    return {
+        "expected_runs_per_game": round(sim.expected_runs_scored, 2),
+        "runs_p05":               round(pct[5],  1),
+        "runs_p25":               round(pct[25], 1),
+        "runs_p50":               round(pct[50], 1),
+        "runs_p75":               round(pct[75], 1),
+        "runs_p95":               round(pct[95], 1),
+        "win_probability":        round(sim.win_probability, 3),
+        "win_prob_ci_low":        round(sim.win_prob_ci_low, 3),
+        "win_prob_ci_high":       round(sim.win_prob_ci_high, 3),
+        "std_dev_runs":           round(sim.std_dev_runs_scored, 2),
+        "uncertainty":            sim.uncertainty_level,
+        "n_simulations":          sim.n_simulations,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Helpers reutilizables
 # ---------------------------------------------------------------------------
 
 def _load_model() -> tuple:
-    with open(MODEL_PATH, "rb") as f:
-        payload = pickle.load(f)
-    predictor = _mat_module.AtBatPredictor(config=payload["config"])
-    predictor._calibrated_model = payload["calibrated_model"]
-    predictor._base_model       = payload["base_model"]
-    predictor._feature_names    = payload["feature_names"]
-    predictor._is_fitted        = True
-    return predictor, len(payload["feature_names"])
+    """Load AtBatPredictor and populate the global FEATURE_COLS from model metadata.
+
+    Returns:
+        (predictor, n_features, feature_names)
+    """
+    global FEATURE_COLS
+
+    predictor = _mat_module.AtBatPredictor.load(str(MODEL_PATH))
+
+    # Sync the global FEATURE_COLS with what this model was actually trained on
+    feature_names = predictor._feature_names or []
+    FEATURE_COLS = feature_names
+
+    n_classes = len(predictor._calibrated_model.classes_)
+    n_feat    = predictor._n_features
+
+    # Sanity checks
+    expected_n_classes = _mat_module.N_CLASSES  # 8
+    if n_classes != expected_n_classes:
+        raise RuntimeError(
+            f"Modelo tiene {n_classes} clases, se esperaban {expected_n_classes}. "
+            "Usa el modelo retrenado con 8 clases (models/at_bat_predictor.pkl)."
+        )
+
+    return predictor, n_feat, feature_names
 
 
 def _predict_one_side(
@@ -345,10 +574,15 @@ def _predict_one_side(
     predictor,
     game_date: str,
     verbose: bool = True,
+    feature_names: list[str] | None = None,
 ) -> dict | None:
     """Calcula el orden optimo para un equipo en un partido.
 
-    Devuelve un dict JSON-serializable, o None si no hay roster suficiente.
+    Returns a JSON-serializable dict plus an internal '_lineup_probs_matrix'
+    key (numpy array, shape 9x8) used by the caller to run Monte Carlo
+    simulation. The caller must pop this key before saving to disk.
+
+    Returns None if the roster has fewer than 9 eligible batters.
     """
     opp_side  = "home" if side == "away" else "away"
     team_info = game["teams"][side]["team"]
@@ -356,10 +590,20 @@ def _predict_one_side(
     home_name = game["teams"]["home"]["team"]["name"]
     pk        = game["gamePk"]
 
-    opp_pitcher = (game["teams"][opp_side]
-                   .get("probablePitcher", {})
-                   .get("fullName", "Unknown"))
-    opp_pitcher_throws = "R"
+    opp_pitcher_data   = game["teams"][opp_side].get("probablePitcher", {})
+    opp_pitcher        = opp_pitcher_data.get("fullName", "Unknown")
+    opp_pitcher_id     = opp_pitcher_data.get("id")
+    opp_pitcher_throws = _fetch_pitcher_hand(opp_pitcher_id)
+
+    # Compute pitcher FIP from Silver data (context only — not a model input yet)
+    from src.features.pitcher_fip import compute_pitcher_fip_for_inference
+    pitcher_fip_ctx = compute_pitcher_fip_for_inference(opp_pitcher_id, silver)
+
+    if verbose and opp_pitcher_id:
+        fip_tag = " [est.]" if pitcher_fip_ctx.get("fip_is_estimated") else ""
+        print(f"  Pitcher rival: {opp_pitcher} ({opp_pitcher_throws}HP)  "
+              f"FIP={pitcher_fip_ctx['fip']:.2f}{fip_tag}  "
+              f"K/9={pitcher_fip_ctx['k9']:.1f}  BB/9={pitcher_fip_ctx['bb9']:.1f}")
 
     lineup = _parse_lineup(game, side)
     if not lineup:
@@ -371,12 +615,13 @@ def _predict_one_side(
     for slot, player in enumerate(lineup, 1):
         pid  = player["id"]
         name = player["fullName"]
-        X    = compute_features(pid, opp_pitcher_throws, silver)
+        fcols = feature_names if feature_names is not None else FEATURE_COLS
+        X    = compute_features(pid, opp_pitcher_throws, silver, fcols)
         pv   = predictor.predict_proba(X.reshape(1, -1))[0]
         ev   = float(pv @ RUN_VALUES)
 
-        woba_s = float(X[FEATURE_COLS.index("woba_stabilized")])
-        iso_s  = float(X[FEATURE_COLS.index("iso_stabilized")])
+        woba_s = float(X[fcols.index("woba_stabilized")]) if "woba_stabilized" in fcols else _LEAGUE_AVG["woba"]
+        iso_s  = float(X[fcols.index("iso_stabilized")])  if "iso_stabilized"  in fcols else _LEAGUE_AVG["iso"]
         obp_e  = min(woba_s / 0.87 + 0.04, 0.450) if woba_s > 0.01 else 0.330
         in_hist = silver.filter(pl.col("batter_id") == pid).height > 0
 
@@ -413,13 +658,10 @@ def _predict_one_side(
     if verbose:
         _print_optimal_order(ordered)
 
-    total_ev = sum(float(r["prob_vector"] @ RUN_VALUES) for r in ordered)
-    avg_ev   = total_ev / 9
-
-    if verbose:
-        print(f"  E[R] suma 9 bateadores:        {total_ev:.4f}")
-        print(f"  E[R/PA] promedio:              {avg_ev:.4f}")
-        print(f"  E[R/partido] estimado (27 PA): {avg_ev * 27:.2f} carreras\n")
+    # Build the lineup probability matrix in batting-order sequence (9 x 8)
+    lineup_probs_matrix = np.array(
+        [players9[i].prob_vector for i in order_idx], dtype=np.float32
+    )
 
     abbr = team_info.get("abbreviation", team_info["name"].replace(" ", "")[:3]).upper()
 
@@ -431,6 +673,7 @@ def _predict_one_side(
         "team_abbr":   abbr,
         "side":        side,
         "opp_pitcher": opp_pitcher,
+        "opp_pitcher_throws": opp_pitcher_throws,
         "roster_used": [r["name"] for r in results],
         "batting_order": [
             {
@@ -445,12 +688,21 @@ def _predict_one_side(
                 "prob_2b":   round(float(players9[i].prob_vector[4]), 4),
                 "prob_3b":   round(float(players9[i].prob_vector[5]), 4),
                 "prob_hr":   round(float(players9[i].prob_vector[6]), 4),
+                "prob_dp":   round(float(players9[i].prob_vector[7])
+                                   if len(players9[i].prob_vector) > 7 else 0.0, 4),
                 "woba_stab": round(players9[i].woba, 4),
                 "obp_est":   round(players9[i].obp, 4),
             }
             for s, i in enumerate(order_idx)
         ],
-        "expected_runs_per_game": round(avg_ev * 27, 2),
+        # Provisional linear estimate (replaced by simulation after both sides processed)
+        "expected_runs_per_game": round(
+            sum(float(players9[i].prob_vector @ RUN_VALUES) for i in order_idx) / 9 * 27, 2
+        ),
+        # Pitcher context (FIP and secondary rates — informational, not fed to model)
+        "opp_pitcher_stats": pitcher_fip_ctx,
+        # Internal field for Monte Carlo — caller must pop before saving JSON
+        "_lineup_probs_matrix": lineup_probs_matrix,
     }
 
 
@@ -476,6 +728,10 @@ def main() -> None:
                         help="Procesar todos los partidos de la fecha (ambos equipos por juego)")
     parser.add_argument("--output-dir", default="results", dest="output_dir",
                         help="Carpeta de salida con --all (default: results/)")
+    parser.add_argument("--no-sim",  action="store_true", dest="no_sim",
+                        help="Omitir simulacion Monte Carlo (mas rapido, E[R] menos preciso)")
+    parser.add_argument("--n-sims",  type=int, default=10_000, dest="n_sims",
+                        help="Simulaciones Monte Carlo por partido (default: 10000)")
     args = parser.parse_args()
 
     game_date = args.date
@@ -486,13 +742,16 @@ def main() -> None:
         return
     print(f"  {len(games)} partidos encontrados")
 
-    print("\nCargando historico Silver (2021-2024)...")
+    print("\nCargando historico Silver (2015-2024)...")
     silver = _load_silver()
     print(f"  {len(silver):,} PAs  |  {silver['batter_id'].n_unique():,} bateadores unicos")
 
+    # Warn if Silver data is significantly behind the prediction date
+    _check_silver_staleness(silver, game_date)
+
     print("\nCargando modelo AtBatPredictor...")
-    predictor, n_feat = _load_model()
-    print(f"  Cargado | {n_feat} features\n")
+    predictor, n_feat, feature_names = _load_model()
+    print(f"  Cargado | {n_feat} features | {len(predictor._calibrated_model.classes_)} clases\n")
 
     # ------------------------------------------------------------------ --all
     if args.all_games:
@@ -508,17 +767,61 @@ def main() -> None:
             print(f"{'='*66}")
             print(f"  {away_name} @ {home_name}  ({t} UTC)")
 
+            # Predict both sides
+            side_results: dict[str, dict] = {}
             for side in ("away", "home"):
                 team = game["teams"][side]["team"]
                 abbr = team.get("abbreviation", team["name"].replace(" ", "")[:3]).upper()
                 print(f"\n  [{side.upper()}] {team['name']}")
-                result = _predict_one_side(game, side, silver, predictor, game_date, verbose=True)
+                result = _predict_one_side(
+                    game, side, silver, predictor, game_date,
+                    verbose=True, feature_names=feature_names,
+                )
                 if result is None:
-                    print(f"  Roster insuficiente — omitido.")
+                    print("  Roster insuficiente — omitido.")
                     skipped.append(f"{abbr} ({side})")
-                    continue
+                else:
+                    side_results[side] = result
+
+            # Run Monte Carlo simulation when both lineups are available
+            if not args.no_sim and len(side_results) == 2:
+                print(f"\n  Simulando partido ({args.n_sims:,} juegos Monte Carlo)...")
+                away_probs = side_results["away"].pop("_lineup_probs_matrix")
+                home_probs = side_results["home"].pop("_lineup_probs_matrix")
+
+                sim_away = _run_game_simulation(away_probs, home_probs,
+                                                n_sims=args.n_sims)
+                sim_home = _run_game_simulation(home_probs, away_probs,
+                                                n_sims=args.n_sims)
+                side_results["away"].update(sim_away)
+                side_results["home"].update(sim_home)
+
+                print(f"  {away_name}: E[R]={sim_away['expected_runs_per_game']}  "
+                      f"P(W)={sim_away['win_probability']:.1%}  "
+                      f"IC90=[{sim_away['runs_p05']}-{sim_away['runs_p95']}]")
+                print(f"  {home_name}: E[R]={sim_home['expected_runs_per_game']}  "
+                      f"P(W)={sim_home['win_probability']:.1%}  "
+                      f"IC90=[{sim_home['runs_p05']}-{sim_home['runs_p95']}]")
+
+            elif not args.no_sim and len(side_results) == 1:
+                # Only one lineup available — simulate vs league-average opponent
+                side = next(iter(side_results))
+                my_probs = side_results[side].pop("_lineup_probs_matrix")
+                sim = _run_game_simulation(my_probs, _LEAGUE_AVG_LINEUP,
+                                           n_sims=args.n_sims)
+                side_results[side].update(sim)
+            else:
+                # --no-sim or no results: remove internal field if present
+                for r in side_results.values():
+                    r.pop("_lineup_probs_matrix", None)
+
+            # Save results to disk
+            for side, result in side_results.items():
+                team = game["teams"][side]["team"]
+                abbr = team.get("abbreviation", team["name"].replace(" ", "")[:3]).upper()
                 fname = out_dir / f"{abbr}_{game_date}.json"
-                fname.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+                fname.write_text(json.dumps(result, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
                 saved.append(str(fname))
                 print(f"  Guardado: {fname}")
 
@@ -572,15 +875,40 @@ def main() -> None:
     pk        = game["gamePk"]
     print(f"  Partido: {away_name} @ {home_name}  (pk={pk})")
 
-    result = _predict_one_side(game, args.side, silver, predictor, game_date, verbose=True)
+    result = _predict_one_side(game, args.side, silver, predictor, game_date,
+                               verbose=True, feature_names=feature_names)
     if result is None:
         print("  No se pudo procesar: roster insuficiente.")
         return
 
+    # Run Monte Carlo simulation
+    if not args.no_sim:
+        my_probs = result.pop("_lineup_probs_matrix")
+        # Try to get the opponent's lineup for a real matchup simulation
+        opp_side = "home" if args.side == "away" else "away"
+        print(f"\n  Simulando ({args.n_sims:,} juegos Monte Carlo)...")
+        opp_result = _predict_one_side(
+            game, opp_side, silver, predictor, game_date,
+            verbose=False, feature_names=feature_names,
+        )
+        if opp_result is not None:
+            opp_probs = opp_result.pop("_lineup_probs_matrix")
+        else:
+            opp_probs = _LEAGUE_AVG_LINEUP
+        sim = _run_game_simulation(my_probs, opp_probs, n_sims=args.n_sims)
+        result.update(sim)
+        print(f"  E[R]={sim['expected_runs_per_game']}  "
+              f"P(W)={sim['win_probability']:.1%}  "
+              f"IC90=[{sim['runs_p05']}-{sim['runs_p95']}]  "
+              f"sigma={sim['std_dev_runs']}")
+    else:
+        result.pop("_lineup_probs_matrix", None)
+
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False),
+                            encoding="utf-8")
         print(f"  Resultados guardados en: {out_path}\n")
 
 

@@ -59,11 +59,17 @@ def _download_season(year: int) -> pl.DataFrame:
 
     Intenta el año completo primero; si falla (error CSV común en años viejos)
     cae back a descarga mes a mes.
+    Para el año en curso usa la fecha de hoy como límite superior.
     """
+    from datetime import date as _date
     from pybaseball import statcast  # noqa: PLC0415
 
-    start = f"{year}-03-28"
-    end   = f"{year}-11-05"
+    today = _date.today()
+    # Opening Day históricamente cae entre el 20 y 28 de marzo
+    start = f"{year}-03-20"
+    # Para el año en curso, no intentar más allá de hoy
+    end_candidate = _date(year, 11, 5)
+    end = str(min(end_candidate, today))
 
     print(f"  Descargando {year} ({start} → {end})...", flush=True)
     t0 = time.time()

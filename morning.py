@@ -224,6 +224,40 @@ def show_schedule(game_date: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Feature drift check (semanal)
+# ---------------------------------------------------------------------------
+
+def _run_weekly_drift_check() -> None:
+    """Runs PSI drift monitor on Mondays or if no report exists from this week."""
+    today_dt   = date.today()
+    drift_dir  = ROOT / "reports" / "drift"
+    drift_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if a drift report already exists this week (Mon–Sun)
+    week_start = today_dt - timedelta(days=today_dt.weekday())
+    existing   = list(drift_dir.glob(f"drift_{week_start}*.json"))
+    if existing and today_dt.weekday() != 0:
+        return  # Not Monday and a report already exists this week
+
+    print(f"{SEP}")
+    print("  CHEQUEO SEMANAL DE FEATURE DRIFT")
+    print(SEP)
+    try:
+        from src.mlops.feature_drift_monitor import DriftMonitor
+        monitor = DriftMonitor(silver_dir=str(ROOT / "data" / "silver" / "plate_appearances"))
+        report  = monitor.run(reference_seasons=[2022, 2023], recent_days=30)
+        monitor.print_summary(report)
+        out = drift_dir / f"drift_{today_dt}.json"
+        out.write_text(
+            __import__("json").dumps(monitor.to_json(report), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"  Reporte drift guardado: {out.resolve()}\n")
+    except Exception as exc:
+        print(f"  [AVISO] Drift monitor no ejecutado: {exc}\n")
+
+
+# ---------------------------------------------------------------------------
 # 3. Predicciones (delega a predict_tonight.py)
 # ---------------------------------------------------------------------------
 
@@ -274,6 +308,9 @@ def main() -> None:
         print(f"  Sin predicciones guardadas para {yesterday}. Saltando reporte.\n")
 
     show_schedule(today)
+
+    # Weekly feature drift check (every Monday or when no check ran this week)
+    _run_weekly_drift_check()
 
     if not args.no_predict:
         run_predictions(today)

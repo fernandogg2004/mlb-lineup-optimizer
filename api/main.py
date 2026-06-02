@@ -14,8 +14,10 @@ Seguridad: Bearer token via cabecera Authorization.
 """
 from __future__ import annotations
 
+import collections
 import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -49,10 +51,11 @@ from api.shadow import ShadowPredictor
 
 log = logging.getLogger("mlb_api")
 
-# Outcomes en el orden que usa MonteCarloEngine (debe coincidir con PAOutcome enum)
-_OUTCOME_KEYS   = ("prob_out", "prob_k", "prob_bb", "prob_1b", "prob_2b", "prob_3b", "prob_hr")
-# Lineup promedio de liga (oponente cuando no tenemos sus probs reales)
-_LEAGUE_AVG_OPP = np.array([0.400, 0.240, 0.090, 0.150, 0.050, 0.005, 0.065], dtype=np.float32)
+# Outcomes en el orden que usa MonteCarloEngine (debe coincidir con PAOutcome enum, 8 clases)
+_OUTCOME_KEYS   = ("prob_out", "prob_k", "prob_bb", "prob_1b", "prob_2b", "prob_3b", "prob_hr", "prob_dp")
+# Lineup promedio de liga (oponente cuando no tenemos sus probs reales) — 8 clases
+# OUT=0.400, K=0.220, BB=0.085, 1B=0.145, 2B=0.048, 3B=0.005, HR=0.062, DP=0.035
+_LEAGUE_AVG_OPP = np.array([0.400, 0.220, 0.085, 0.145, 0.048, 0.005, 0.062, 0.035], dtype=np.float32)
 
 
 def _mc_run(my_probs: np.ndarray, opp_probs: np.ndarray, n_sims: int):
@@ -197,6 +200,42 @@ def verify_token(credentials: HTTPAuthorizationCredentials | None = Security(_be
 
 
 # ---------------------------------------------------------------------------
+# Rate limiter (in-memory, per-IP, no external dependency)
+# ---------------------------------------------------------------------------
+_rl_store: dict[str, collections.deque] = {}
+_rl_lock = threading.Lock()
+
+
+def _rate_limit(
+    request: Request,
+    max_calls: int = 2,
+    window_secs: int = 60,
+) -> None:
+    """Raises HTTP 429 if the caller exceeds max_calls within window_secs.
+
+    Uses a sliding-window deque per client IP. Thread-safe via a global lock.
+    Designed for expensive endpoints (GA lineup optimization, 3–30 s each).
+    """
+    ip = (request.client.host if request.client else "unknown")
+    key = f"{request.url.path}:{ip}"
+    now = time.monotonic()
+    with _rl_lock:
+        dq = _rl_store.setdefault(key, collections.deque())
+        while dq and now - dq[0] > window_secs:
+            dq.popleft()
+        if len(dq) >= max_calls:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Rate limit: máximo {max_calls} peticiones "
+                    f"por {window_secs}s en este endpoint."
+                ),
+                headers={"Retry-After": str(window_secs)},
+            )
+        dq.append(now)
+
+
+# ---------------------------------------------------------------------------
 # Schemas Pydantic
 # ---------------------------------------------------------------------------
 class BatterPrediction(BaseModel):
@@ -211,6 +250,7 @@ class BatterPrediction(BaseModel):
     prob_2b:   float
     prob_3b:   float
     prob_hr:   float
+    prob_dp:   float = 0.0   # clase 7 DOUBLE_PLAY (modelo 8-clases)
     woba_stab: float
     obp_est:   float
 
@@ -299,7 +339,8 @@ async def predict_game(
     for side in ("away", "home"):
         try:
             r = _predict_one_side(
-                game, side, _state["silver"], _state["predictor"], game_date, verbose=False
+                game, side, _state["silver"], _state["predictor"], game_date, verbose=False,
+                feature_names=_state.get("feature_names"),
             )
             if r:
                 r["model_version"] = _state["model_version"]
@@ -339,6 +380,7 @@ async def predict_all(
                 r = _predict_one_side(
                     game, side, _state["silver"], _state["predictor"],
                     req.game_date, verbose=False,
+                    feature_names=_state.get("feature_names"),
                 )
                 if r:
                     r["model_version"] = _state["model_version"]
@@ -729,6 +771,7 @@ def _generate_tactical_explanation(
 @app.get("/v1/optimize/{game_pk}", tags=["dashboard"])
 async def get_optimize(
     game_pk: int,
+    request: Request,
     team: str = "home",
     n_sims: int = 10_000,
     _: None = Depends(_optional_token),
@@ -736,7 +779,10 @@ async def get_optimize(
     """
     Lineup óptimo calculado en tiempo real — sin PostgreSQL.
     Usa el modelo y Silver ya cargados en memoria al arrancar uvicorn.
+    Limitado a 2 peticiones/min por IP (el cálculo GA puede tardar 3-30 s).
     """
+    _rate_limit(request, max_calls=2, window_secs=60)
+
     import requests as _req
     from predict_tonight import _predict_one_side
 
@@ -768,6 +814,7 @@ async def get_optimize(
         result = _predict_one_side(
             game, team, _state["silver"], _state["predictor"],
             game_date, verbose=False,
+            feature_names=_state.get("feature_names"),
         )
         log.info("optimize: prediccion completada, er=%.2f", result.get("expected_runs_per_game", 0) if result else 0)
     except Exception as exc:
@@ -2180,6 +2227,163 @@ async def player_fatigue(
         "validation_status": "pending_backtest",
         "note": "Factor disponible pero no aplicado automáticamente hasta que mejore el Log-Loss out-of-sample (Roadmap 3.1).",
     }
+
+
+# ---------------------------------------------------------------------------
+# SHAP explainability endpoint
+# ---------------------------------------------------------------------------
+
+class SHAPFeature(BaseModel):
+    feature:   str
+    shap_value: float
+    direction: str   # "positive" | "negative"
+    magnitude: str   # "high" | "medium" | "low"
+
+
+class SHAPResponse(BaseModel):
+    batter_id:     int
+    batter_name:   str
+    game_pk:       int
+    opp_pitcher:   str
+    top_features:  list[SHAPFeature]
+    expected_runs_per_pa: float
+    model_version: str
+    note:          str
+
+
+@app.get(
+    "/v1/explain/{game_pk}/{batter_id}",
+    response_model=SHAPResponse,
+    tags=["explainability"],
+)
+async def explain_batter(
+    game_pk:   int,
+    batter_id: int,
+    request:   Request,
+    team:      str = "away",
+    top_n:     int = 10,
+    _: None = Depends(_optional_token),
+) -> SHAPResponse:
+    """Returns SHAP feature importance for a specific batter in a game.
+
+    The response identifies which features (rolling wOBA, platoon splits,
+    ISO, etc.) are pushing the batter's E[R/PA] above or below the league
+    average — ready to render as a horizontal bar chart in the dashboard.
+
+    Args:
+        game_pk:   MLB game identifier.
+        batter_id: MLB player identifier.
+        team:      "away" or "home" (determines which lineup side to fetch).
+        top_n:     Number of top features to return (max 20).
+    """
+    _rate_limit(request, max_calls=10, window_secs=60)
+
+    import requests as _req
+    from predict_tonight import (
+        _fetch_pitcher_hand,
+        compute_features,
+    )
+
+    if "predictor" not in _state:
+        raise HTTPException(status_code=503, detail="Modelo no cargado.")
+
+    predictor     = _state["predictor"]
+    feature_names = _state.get("feature_names") or []
+    silver        = _state.get("silver")
+
+    if silver is None or silver.is_empty():
+        raise HTTPException(status_code=503, detail="Silver data no disponible.")
+
+    # 1. Fetch game data
+    try:
+        resp = _req.get(
+            f"{_STATS_BASE}/schedule",
+            params={"sportId": 1, "gamePk": game_pk,
+                    "hydrate": "lineups,team,probablePitcher"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        games = [g for d in resp.json().get("dates", []) for g in d.get("games", [])]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MLB API error: {exc}")
+
+    if not games:
+        raise HTTPException(status_code=404, detail=f"gamePk {game_pk} no encontrado.")
+
+    game      = games[0]
+    opp_side  = "home" if team == "away" else "away"
+    opp_pp    = game["teams"][opp_side].get("probablePitcher", {})
+    opp_name  = opp_pp.get("fullName", "Unknown")
+    opp_pid   = opp_pp.get("id")
+    opp_throws = _fetch_pitcher_hand(opp_pid)
+
+    # 2. Identify batter name from Silver or MLB API
+    batter_rows = silver.filter(silver["batter_id"] == batter_id) if silver is not None else None
+    batter_name = f"Player {batter_id}"
+    if opp_pid:
+        try:
+            pdata = _req.get(f"{_STATS_BASE}/people/{batter_id}", timeout=8).json()
+            batter_name = (pdata.get("people") or [{}])[0].get("fullName", batter_name)
+        except Exception:
+            pass
+
+    # 3. Build feature vector
+    try:
+        X = compute_features(batter_id, opp_throws, silver, feature_names)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Feature computation error: {exc}")
+
+    ev_per_pa = float(predictor.predict_proba(X.reshape(1, -1))[0] @ np.array(
+        [0.0, 0.0, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43], dtype=np.float32
+    ))
+
+    # 4. Compute SHAP values (requires shap library)
+    try:
+        mean_abs_shap = predictor.explain(X.reshape(1, -1), max_display=top_n)
+    except ImportError:
+        raise HTTPException(
+            status_code=501,
+            detail="SHAP no instalado. Ejecuta: pip install shap",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"SHAP error: {exc}")
+
+    # 5. Build ranked response
+    top_n_clamped = min(max(top_n, 1), 20)
+    top_idx = np.argsort(mean_abs_shap)[::-1][:top_n_clamped]
+    max_shap = float(mean_abs_shap[top_idx[0]]) if len(top_idx) > 0 else 1.0
+
+    def _magnitude(v: float) -> str:
+        ratio = v / max(max_shap, 1e-9)
+        if ratio >= 0.5:
+            return "high"
+        if ratio >= 0.2:
+            return "medium"
+        return "low"
+
+    top_features = [
+        SHAPFeature(
+            feature=feature_names[i] if i < len(feature_names) else f"feat_{i}",
+            shap_value=round(float(mean_abs_shap[i]), 5),
+            direction="positive" if mean_abs_shap[i] >= 0 else "negative",
+            magnitude=_magnitude(abs(float(mean_abs_shap[i]))),
+        )
+        for i in top_idx
+    ]
+
+    return SHAPResponse(
+        batter_id=batter_id,
+        batter_name=batter_name,
+        game_pk=game_pk,
+        opp_pitcher=f"{opp_name} ({opp_throws}HP)",
+        top_features=top_features,
+        expected_runs_per_pa=round(ev_per_pa, 4),
+        model_version=_state.get("model_version", "unknown"),
+        note=(
+            "SHAP values = mean |SHAP| across all 8 PA outcome classes. "
+            "Positive = feature increases E[R/PA]; Negative = decreases it."
+        ),
+    )
 
 
 if __name__ == "__main__":

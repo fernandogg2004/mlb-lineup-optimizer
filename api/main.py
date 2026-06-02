@@ -53,9 +53,9 @@ log = logging.getLogger("mlb_api")
 
 # Outcomes en el orden que usa MonteCarloEngine (debe coincidir con PAOutcome enum, 8 clases)
 _OUTCOME_KEYS   = ("prob_out", "prob_k", "prob_bb", "prob_1b", "prob_2b", "prob_3b", "prob_hr", "prob_dp")
-# Lineup promedio de liga (oponente cuando no tenemos sus probs reales) — 8 clases
-# OUT=0.400, K=0.220, BB=0.085, 1B=0.145, 2B=0.048, 3B=0.005, HR=0.062, DP=0.035
-_LEAGUE_AVG_OPP = np.array([0.400, 0.220, 0.085, 0.145, 0.048, 0.005, 0.062, 0.035], dtype=np.float32)
+# Lineup promedio de liga — importado de src.constants (fuente única de verdad)
+from src.constants import LEAGUE_AVG_PA_PROBS as _LEAGUE_AVG_OPP_RAW  # noqa: E402
+_LEAGUE_AVG_OPP = _LEAGUE_AVG_OPP_RAW
 
 
 def _mc_run(my_probs: np.ndarray, opp_probs: np.ndarray, n_sims: int):

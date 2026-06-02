@@ -51,14 +51,15 @@ _TRIPLE       = 5
 _HOME_RUN     = 6
 _DOUBLE_PLAY  = 7
 
-# FIP constant calibrated for 2015-2024 MLB data.
-# Represents league average ERA minus raw FIP component over the same period.
-_CFIP_DEFAULT: float = 3.10
-
-# Reasonable FIP range guard — returns neutral 4.20 for insufficient data.
-_FIP_FLOOR = 1.50
-_FIP_CEIL  = 9.00
-_FIP_NEUTRAL = 4.20  # MLB average FIP
+# FIP constants — importados de src.constants (fuente única de verdad).
+from src.constants import (  # noqa: E402
+    FIP_CONSTANT as _CFIP_DEFAULT,
+    FIP_NEUTRAL  as _FIP_NEUTRAL,
+    FIP_FLOOR    as _FIP_FLOOR,
+    FIP_CEIL     as _FIP_CEIL,
+    FIP_MIN_PA,
+    LEAGUE_AVG   as _LEAGUE_AVG_FIP,
+)
 
 
 @dataclass

@@ -112,13 +112,10 @@ class PAOutcome(IntEnum):
 OUTCOME_NAMES: list[str] = [o.name for o in PAOutcome]
 N_CLASSES: int = len(PAOutcome)   # 8
 
-# Linear run values (used for sanity-check of calibrated probs)
+# Linear run values — importados de src.constants (fuente única de verdad).
 # Sources: FanGraphs 2024 linear weights (indices 0-6) +
-#          Retrosheet 2015-2024 for DOUBLE_PLAY (index 7):
-#          GIDP creates 2 outs AND removes runner on 1B → approx -0.43 wOBA penalty
-RUN_VALUES: np.ndarray = np.array(
-    [0.00, 0.00, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43], dtype=np.float32
-)
+#          Retrosheet 2015-2024 for DOUBLE_PLAY (index 7).
+from src.constants import RUN_VALUES  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

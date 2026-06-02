@@ -50,8 +50,7 @@ MLB_API = "https://statsapi.mlb.com/api/v1"
 #   0=OUT_IN_PLAY  1=STRIKEOUT  2=WALK_HBP  3=SINGLE  4=DOUBLE
 #   5=TRIPLE       6=HOME_RUN   7=DOUBLE_PLAY (GIDP)
 OUTCOME_NAMES = ["OUT", "K", "BB/HBP", "1B", "2B", "3B", "HR", "DP"]
-RUN_VALUES    = np.array([0.0, 0.0, 0.33, 0.47, 0.77, 1.04, 1.40, -0.43],
-                          dtype=np.float32)
+from src.constants import RUN_VALUES  # noqa: E402  — single source of truth
 
 # Post-hoc calibration scale for Monte Carlo E[R/game] output.
 # The model (trained with LOG_SCALED_CLASS_WEIGHTS + FIP features) inflates hit
@@ -65,15 +64,8 @@ _MC_RUNS_SCALE: float = 0.768
 MODEL_PATH = ROOT / "models" / "at_bat_predictor.pkl"
 SILVER_DIR = ROOT / "data" / "silver" / "plate_appearances"
 
-# James-Stein stabilization thresholds (Lichtman 2010 / "The Book")
-_STAB_T = {"woba": 200, "k_rate": 60, "bb_rate": 120, "babip": 500, "iso": 160}
-_LEAGUE_AVG = {
-    "woba":    0.318,
-    "k_rate":  0.224,
-    "bb_rate": 0.083,
-    "babip":   0.298,
-    "iso":     0.147,
-}
+# James-Stein stabilization thresholds and league averages — from central constants.
+from src.constants import STAB_T as _STAB_T, LEAGUE_AVG as _LEAGUE_AVG  # noqa: E402
 
 # Pitch-type encoding (must match build_gold_v3.py _PITCH_TYPE_MAP)
 _PITCH_TYPE_ENC = {
@@ -81,14 +73,8 @@ _PITCH_TYPE_ENC = {
     "CU": 6, "KC": 7, "FS": 8, "CS": 9, "ST": 10,
 }
 
-# League-average PA outcome distribution (MLB 2023 rates, 8-class).
-# Used as opponent proxy when only one lineup is available.
-_LEAGUE_AVG_PA_PROBS = np.array(
-    [0.451, 0.223, 0.092, 0.150, 0.050, 0.008, 0.032, 0.010],
-    dtype=np.float32,
-)
-_LEAGUE_AVG_PA_PROBS /= _LEAGUE_AVG_PA_PROBS.sum()
-_LEAGUE_AVG_LINEUP: np.ndarray = np.tile(_LEAGUE_AVG_PA_PROBS, (9, 1))
+# League-average PA outcome distribution — from central constants.
+from src.constants import LEAGUE_AVG_PA_PROBS as _LEAGUE_AVG_PA_PROBS, LEAGUE_AVG_LINEUP as _LEAGUE_AVG_LINEUP  # noqa: E402
 
 # FEATURE_COLS is fetched from the model at runtime (see _load_model).
 # This empty sentinel is replaced after the model loads.

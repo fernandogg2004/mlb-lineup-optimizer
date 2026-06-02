@@ -45,22 +45,16 @@ RAW_SEASONS = {2021, 2022, 2023, 2024}
 # Default pitch count imputation for seasons without raw data
 PITCH_COUNT_IMPUTE = 4.0
 
-# Shrinkage (Marcel-style) stabilization thresholds (PA at 50% signal)
-STABILIZE_T = {
-    "woba":  200,
-    "k":      60,
-    "bb":    120,
-    "babip": 500,
-    "iso":   160,
-}
+# Stabilization thresholds and league priors — imported from central constants.
+from src.constants import STAB_T as STABILIZE_T, LEAGUE_AVG as _LEAGUE_PRIORS_RAW  # noqa: E402
 
-# League-average priors (FanGraphs 2024 reference)
+# Remap keys to the "short" form used internally in this file
 LEAGUE_PRIORS = {
-    "woba":  0.318,
-    "k":     0.229,
-    "bb":    0.087,
-    "babip": 0.295,
-    "iso":   0.166,
+    "woba":  _LEAGUE_PRIORS_RAW["woba"],
+    "k":     _LEAGUE_PRIORS_RAW["k_rate"],
+    "bb":    _LEAGUE_PRIORS_RAW["bb_rate"],
+    "babip": _LEAGUE_PRIORS_RAW["babip"],
+    "iso":   _LEAGUE_PRIORS_RAW["iso"],
 }
 
 

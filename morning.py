@@ -39,6 +39,27 @@ SEP2 = "-" * 62
 
 
 # ---------------------------------------------------------------------------
+# File-path helpers (new date-subdir structure, backward-compatible)
+# ---------------------------------------------------------------------------
+
+def _pred_files(results_dir: Path, game_date: str) -> list[Path]:
+    """Returns prediction JSONs for a date. Checks new date-subdir structure first,
+    falls back to old flat structure for backward compatibility."""
+    date_dir = results_dir / game_date
+    if date_dir.is_dir():
+        return sorted(date_dir.glob("*.json"))
+    return sorted(results_dir.glob(f"*_{game_date}.json"))
+
+
+def _comparison_path(reports_dir: Path, game_date: str) -> Path:
+    """Returns the path where the comparison report for a date should be saved
+    (new date-subdir structure)."""
+    date_dir = reports_dir / game_date
+    date_dir.mkdir(parents=True, exist_ok=True)
+    return date_dir / "comparison.json"
+
+
+# ---------------------------------------------------------------------------
 # MLB API helper
 # ---------------------------------------------------------------------------
 
@@ -74,7 +95,7 @@ def post_game_report(game_date: str) -> None:
 
     # Pre-load all prediction JSONs for this date
     pred_by_pk: dict[int, list[dict]] = {}
-    for pf in RESULTS_DIR.glob(f"*_{game_date}.json"):
+    for pf in _pred_files(RESULTS_DIR, game_date):
         try:
             p = json.loads(pf.read_text(encoding="utf-8"))
             pk = p.get("game_pk")
@@ -185,8 +206,7 @@ def post_game_report(game_date: str) -> None:
         },
     }
 
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = REPORTS_DIR / f"comparison_{game_date}.json"
+    out_path = _comparison_path(REPORTS_DIR, game_date)
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"  Informe guardado en: {out_path.resolve()}")
 
@@ -302,7 +322,7 @@ def main() -> None:
     print(f"\n{'MLB OPTIMIZER -- RUTINA DIARIA':^62}")
     print(f"{'Hoy: ' + today + ' | Ayer: ' + yesterday:^62}\n")
 
-    yesterday_preds = list(RESULTS_DIR.glob(f"*_{yesterday}.json"))
+    yesterday_preds = _pred_files(RESULTS_DIR, yesterday)
     if yesterday_preds:
         post_game_report(yesterday)
     else:

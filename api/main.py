@@ -205,6 +205,43 @@ def verify_token(credentials: HTTPAuthorizationCredentials | None = Security(_be
 _rl_store: dict[str, collections.deque] = {}
 _rl_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# File-path helpers (new date-subdir structure, backward-compatible)
+# ---------------------------------------------------------------------------
+_ROOT_DIR = Path(__file__).parent.parent
+
+
+def _pred_files_api(results_dir: Path, date: str) -> list[Path]:
+    """Returns prediction JSONs for a date. New structure first, old as fallback."""
+    date_dir = results_dir / date
+    if date_dir.is_dir():
+        return sorted(date_dir.glob("*.json"))
+    return sorted(results_dir.glob(f"*_{date}.json"))
+
+
+def _comparison_candidates(reports_dir: Path, date: str | None) -> list[Path]:
+    """Returns candidate comparison JSON paths to try, newest first."""
+    if date:
+        candidates = [
+            reports_dir / date / "comparison.json",       # new structure
+            reports_dir / f"comparison_{date}.json",      # old structure
+        ]
+        return [p for p in candidates if p.exists()]
+    # No date: return all, new subdirs + old flat files, deduped newest-first
+    new = sorted(reports_dir.glob("*/comparison.json"), reverse=True)
+    old = sorted(reports_dir.glob("comparison_*.json"), reverse=True)
+    seen: set[Path] = set(new)
+    return new + [p for p in old if p not in seen]
+
+
+def _all_result_files(results_dir: Path) -> list[Path]:
+    """Returns all prediction JSONs across both new (date-subdir) and old (flat) structures."""
+    new = sorted(results_dir.glob("*/*.json"))           # results/YYYY-MM-DD/ABBR.json
+    old = sorted(results_dir.glob("*_2*.json"))          # results/ABBR_YYYY-MM-DD.json (old)
+    # Dedupe: prefer new, skip old that have same content path
+    new_names = {f.name for f in new}
+    return new + [f for f in old if f.name not in new_names]
+
 
 def _rate_limit(
     request: Request,
@@ -1068,7 +1105,7 @@ async def games_history(date: str, _: None = Depends(_optional_token)) -> dict:
         ROOT_DIR_H    = Path(__file__).parent.parent
         RESULTS_DIR_H = ROOT_DIR_H / "results"
         pred_pks_h: set[int] = set()
-        for pf_h in RESULTS_DIR_H.glob(f"*_{date}.json"):
+        for pf_h in _pred_files_api(RESULTS_DIR_H, date):
             try:
                 _p = _json.loads(pf_h.read_text(encoding="utf-8"))
                 if _p.get("game_pk"):
@@ -1119,11 +1156,7 @@ async def get_report(game_pk: int, date: str | None = None,
         REPORTS_DIR = ROOT_DIR / "reports" / "comparison"
 
         # Search by given date first, then all available files (newest first)
-        candidates: list[Path] = (
-            [REPORTS_DIR / f"comparison_{date}.json"]
-            if date
-            else sorted(REPORTS_DIR.glob("comparison_*.json"), reverse=True)
-        )
+        candidates: list[Path] = _comparison_candidates(REPORTS_DIR, date)
 
         comp_game: dict | None = None
         found_date: str = date or ""
@@ -1167,7 +1200,7 @@ async def get_report(game_pk: int, date: str | None = None,
             _active_side_cj = "home"
             _cj_home_pred = None
             _cj_away_pred = None
-            for pf in RESULTS_DIR.glob(f"*_{found_date}.json"):
+            for pf in _pred_files_api(RESULTS_DIR, found_date):
                 try:
                     p = _json.loads(pf.read_text(encoding="utf-8"))
                     if p.get("game_pk") == game_pk:
@@ -1304,7 +1337,7 @@ async def get_report(game_pk: int, date: str | None = None,
         import math as _math2
         date_str2 = date or ""
         preds2: list[dict] = []
-        for pf in RESULTS_DIR.glob(f"*_{date_str2}.json"):
+        for pf in _pred_files_api(RESULTS_DIR, date_str2):
             try:
                 p2 = _json.loads(pf.read_text(encoding="utf-8"))
                 if p2.get("game_pk") == game_pk:
@@ -1486,8 +1519,7 @@ async def get_report(game_pk: int, date: str | None = None,
     if not row:
         # Fallback: DB unreachable or game not in DB — check comparison JSON
         _rd   = Path(__file__).parent.parent / "reports" / "comparison"
-        _cands = ([_rd / f"comparison_{date}.json"] if date
-                  else sorted(_rd.glob("comparison_*.json"), reverse=True))
+        _cands = _comparison_candidates(_rd, date)
         for _cp in _cands:
             if not _cp.exists():
                 continue
@@ -1531,7 +1563,7 @@ async def get_report(game_pk: int, date: str | None = None,
                     _results_dir = Path(__file__).parent.parent / "results"
                     _fb_home_pred = None
                     _fb_away_pred = None
-                    for _pf in _results_dir.glob(f"*_{_fd}.json"):
+                    for _pf in _pred_files_api(_results_dir, _fd):
                         try:
                             _p = _json.loads(_pf.read_text(encoding="utf-8"))
                             if _p.get("game_pk") == game_pk:
@@ -1943,7 +1975,7 @@ async def calibration_metrics(_: None = Depends(_optional_token)) -> dict:
 
     # Build on-the-fly from comparison JSONs
     actuals: dict[int, tuple[int, int]] = {}
-    for cf in COMP_CAL.glob("comparison_*.json"):
+    for cf in _comparison_candidates(COMP_CAL, None):
         try:
             data = _json_cal.loads(cf.read_text(encoding="utf-8"))
             for g in data.get("games", []):
@@ -1956,7 +1988,7 @@ async def calibration_metrics(_: None = Depends(_optional_token)) -> dict:
             pass
 
     predictions: list[tuple[float, int]] = []
-    for fp in sorted(RESULTS_CAL.glob("*_2*.json")):
+    for fp in _all_result_files(RESULTS_CAL):
         try:
             d = _json_cal.loads(fp.read_text(encoding="utf-8"))
             if d.get("side") != "home":

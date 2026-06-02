@@ -752,7 +752,7 @@ def main() -> None:
     parser.add_argument("--game-pk", type=int, default=None, dest="game_pk",
                         help="gamePk especifico (omite seleccion interactiva)")
     parser.add_argument("--output",  default=None, metavar="FILE",
-                        help="Guardar resultado en JSON (ej. results/NYY_2026-05-19.json)")
+                        help="Guardar resultado en JSON (ej. results/2026-05-19/NYY.json)")
     parser.add_argument("--all",     action="store_true", dest="all_games",
                         help="Procesar todos los partidos de la fecha (ambos equipos por juego)")
     parser.add_argument("--output-dir", default="results", dest="output_dir",
@@ -848,7 +848,9 @@ def main() -> None:
             for side, result in side_results.items():
                 team = game["teams"][side]["team"]
                 abbr = team.get("abbreviation", team["name"].replace(" ", "")[:3]).upper()
-                fname = out_dir / f"{abbr}_{game_date}.json"
+                date_dir = out_dir / game_date
+                date_dir.mkdir(parents=True, exist_ok=True)
+                fname = date_dir / f"{abbr}.json"
                 fname.write_text(json.dumps(result, indent=2, ensure_ascii=False),
                                  encoding="utf-8")
                 saved.append(str(fname))
@@ -858,7 +860,7 @@ def main() -> None:
         print(f"  Archivos guardados : {len(saved)}")
         if skipped:
             print(f"  Omitidos           : {', '.join(skipped)}")
-        print(f"  Carpeta            : {Path(args.output_dir).resolve()}\n")
+        print(f"  Carpeta            : {(Path(args.output_dir) / game_date).resolve()}\n")
         return
 
     # -------------------------------------------------------------- un partido

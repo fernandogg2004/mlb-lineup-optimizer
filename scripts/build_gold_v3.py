@@ -36,6 +36,11 @@ SILVER_ROOT  = REPO_ROOT / "data" / "silver" / "plate_appearances"
 RAW_ROOT     = REPO_ROOT / "data" / "raw"
 OUTPUT_PATH  = REPO_ROOT / "data" / "gold" / "features_train_v3.parquet"
 
+# Ensure repo root is on sys.path so that `src.*` imports resolve correctly
+# regardless of the working directory the script is invoked from.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 # ─── Label constants ───────────────────────────────────────────────────────────
 GIDP_EVENTS = {"grounded_into_double_play", "strikeout_double_play", "double_play"}
 
@@ -177,51 +182,37 @@ def build_raw_pa_table(season: int) -> pl.DataFrame:
 # Step 3 — Join raw augmentation into Silver
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_pitch_count_imputes(silver: pl.DataFrame) -> dict[int, float]:
-    """Computes per-season median pitch count from raw Statcast seasons.
+def compute_pitch_count_imputes(silver: pl.DataFrame) -> None:
+    """Diagnoses pitch count data availability in the raw Statcast files.
 
-    Pre-RAW seasons (2015-2020) receive the median from the earliest RAW season
-    as a proxy — more accurate than the hardcoded global 4.0 fallback.
+    If raw Statcast parquets are PA-level aggregates (1 row/PA) rather than
+    pitch-level sequences, the median pitch_count will be ~1 and a warning
+    is printed. In that case PITCH_COUNT_IMPUTE=4.0 (global median) is used
+    unchanged for all seasons without raw data.
 
-    Returns a dict mapping season → imputation value.
+    This function is informational only — it does NOT modify PITCH_COUNT_IMPUTE
+    unless real pitch-level data (median > 2.0) is detected.
     """
-    global _PC_IMPUTE_BY_SEASON, PITCH_COUNT_IMPUTE
+    global PITCH_COUNT_IMPUTE
 
     if "pitch_count_in_pa" not in silver.columns or "season" not in silver.columns:
-        return {}
+        return
 
-    raw_seasons_in_silver = silver.filter(pl.col("season").is_in(list(RAW_SEASONS)))
-    if raw_seasons_in_silver.is_empty():
-        return {}
+    raw_rows = silver.filter(pl.col("season").is_in(list(RAW_SEASONS)))
+    if raw_rows.is_empty():
+        return
 
-    season_medians = (
-        raw_seasons_in_silver
-        .filter(pl.col("pitch_count_in_pa").is_not_null())
-        .group_by("season")
-        .agg(pl.col("pitch_count_in_pa").median().alias("median_pc"))
-        .sort("season")
-    )
+    median_pc = raw_rows["pitch_count_in_pa"].drop_nulls().median()
+    if median_pc is None:
+        return
 
-    by_season: dict[int, float] = {
-        int(row["season"]): round(float(row["median_pc"]), 2)
-        for row in season_medians.iter_rows(named=True)
-    }
-
-    # Pre-RAW seasons: use the earliest RAW season median as proxy
-    if by_season:
-        proxy = by_season[min(by_season.keys())]
-        all_seasons = silver["season"].unique().to_list()
-        for s in all_seasons:
-            if int(s) not in by_season:
-                by_season[int(s)] = proxy
-
-    _PC_IMPUTE_BY_SEASON = by_season
-    # Update global fallback to the overall median across raw seasons
-    if by_season:
-        PITCH_COUNT_IMPUTE = round(float(sum(by_season.values()) / len(by_season)), 2)
-
-    print(f"  Pitch count imputes: {dict(sorted(by_season.items()))}")
-    return by_season
+    if median_pc < 2.0:
+        print(f"  [INFO] Raw Statcast parquets son PA-level (median pitch_count={median_pc:.1f}). "
+              f"Usando PITCH_COUNT_IMPUTE={PITCH_COUNT_IMPUTE} para temporadas sin raw data.")
+    else:
+        # Real pitch-sequence data available — update global impute
+        PITCH_COUNT_IMPUTE = round(float(median_pc), 2)
+        print(f"  Pitch count impute actualizado desde datos reales: {PITCH_COUNT_IMPUTE}")
 
 
 def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
@@ -282,15 +273,7 @@ def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
             .alias("is_gidp"),
         # pitch_count season-specific: usa _PC_IMPUTE_BY_SEASON si disponible,
         # cae al global PITCH_COUNT_IMPUTE (calculado o fallback 4.0) si no.
-        pl.when(pl.col("pitch_count_raw").is_not_null())
-            .then(pl.col("pitch_count_raw").cast(pl.Float32))
-            .otherwise(
-                pl.col("season").map_elements(
-                    lambda s: float(_PC_IMPUTE_BY_SEASON.get(int(s), PITCH_COUNT_IMPUTE)),
-                    return_dtype=pl.Float32,
-                )
-            )
-            .alias("pitch_count_in_pa"),
+        pl.col("pitch_count_raw").fill_null(PITCH_COUNT_IMPUTE).cast(pl.Float32).alias("pitch_count_in_pa"),
     ]).drop(["is_gidp_raw", "pitch_count_raw"])
 
     print(f"Augmentation done  GIDP rows: {silver['is_gidp'].sum():,}  [{time.time()-t0:.1f}s]")

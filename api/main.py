@@ -2329,7 +2329,8 @@ async def explain_batter(
 
     # 3. Build feature vector
     try:
-        X = compute_features(batter_id, opp_throws, silver, feature_names)
+        X = compute_features(batter_id, opp_throws, silver, feature_names,
+                             pitcher_id=opp_pid)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Feature computation error: {exc}")
 

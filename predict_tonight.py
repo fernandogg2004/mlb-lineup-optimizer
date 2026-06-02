@@ -210,6 +210,7 @@ def compute_features(
     pitcher_throws: str,
     silver: pl.DataFrame,
     feature_names: list[str] | None = None,
+    pitcher_id: int | None = None,
 ) -> np.ndarray:
     """
     Construye el vector de features para un bateador vs un tipo de lanzador.
@@ -220,9 +221,10 @@ def compute_features(
       3. Rolling sobre ultimos N JUEGOS (no PAs) sin shift -> stats "as of last known game"
       4. EWMA sobre xwoba_mean diario
       5. Platoon stats (vs pitcher_throws) con shrinkage James-Stein
-      6. Nuevas features (Mejoras 2 y 4): batter_stand, pitcher_throws (enc.),
-         last_pitch_type (=0 pre-partido), pitch_count_in_pa (=4.0 imputed),
-         era_shift_ban, era_universal_dh, era_first_year_shift_ban.
+      6. Context features: batter_stand, pitcher_throws (enc.), last_pitch_type,
+         pitch_count_in_pa, era_shift_ban, era_universal_dh, era_first_year_shift_ban.
+      7. Pitcher FIP features (rolling 30-game from Silver): pitcher_fip,
+         pitcher_k_rate, pitcher_bb_rate, pitcher_hr_rate.
 
     Args:
         batter_id:      MLB batter identifier.
@@ -230,6 +232,8 @@ def compute_features(
         silver:         Silver plate_appearances DataFrame (all seasons).
         feature_names:  Ordered list from the loaded model (_feature_names).
                         When None, falls back to the module-level FEATURE_COLS.
+        pitcher_id:     MLB pitcher identifier. When provided, real FIP stats are
+                        computed from Silver; otherwise league-average values are used.
     """
     from src.features.features_rolling import _add_pa_event_flags, _aggregate_to_daily
 
@@ -266,9 +270,17 @@ def compute_features(
     era_universal_dh       = 1 if current_year >= 2020 else 0
     era_first_year_shift_ban = 1 if current_year == 2023 else 0
 
+    # ── Pitcher FIP features from Silver history ─────────────────────────────
+    from src.features.pitcher_fip import compute_pitcher_fip as _compute_fip
+    _fip = _compute_fip(pitcher_id, silver) if pitcher_id else None
+    pitcher_fip_val     = _fip.fip   if (_fip and not _fip.is_neutral) else 4.20
+    pitcher_k_rate_val  = _fip.k_pct if (_fip and not _fip.is_neutral) else 0.224
+    pitcher_bb_rate_val = _fip.bb_pct if (_fip and not _fip.is_neutral) else 0.083
+    pitcher_hr_rate_val = _fip.hr_pct if (_fip and not _fip.is_neutral) else 0.033
+
     # ── League-average defaults for all rolling/stabilized features ──────────
     _defaults: dict[str, float] = {
-        # new features
+        # context features
         "batter_stand":          float(batter_stand_enc),
         "pitcher_throws":        float(pitcher_throws_enc),
         "last_pitch_type":       float(last_pitch_type_enc),
@@ -277,6 +289,11 @@ def compute_features(
         "era_shift_ban":          float(era_shift_ban),
         "era_universal_dh":       float(era_universal_dh),
         "era_first_year_shift_ban": float(era_first_year_shift_ban),
+        # pitcher FIP features
+        "pitcher_fip":            pitcher_fip_val,
+        "pitcher_k_rate":         pitcher_k_rate_val,
+        "pitcher_bb_rate":        pitcher_bb_rate_val,
+        "pitcher_hr_rate":        pitcher_hr_rate_val,
         # rolling (league avg)
         "babip_shrinkage_b":      1.0,
         "babip_stabilized":       _LEAGUE_AVG["babip"],
@@ -616,7 +633,8 @@ def _predict_one_side(
         pid  = player["id"]
         name = player["fullName"]
         fcols = feature_names if feature_names is not None else FEATURE_COLS
-        X    = compute_features(pid, opp_pitcher_throws, silver, fcols)
+        X    = compute_features(pid, opp_pitcher_throws, silver, fcols,
+                                pitcher_id=opp_pitcher_id)
         pv   = predictor.predict_proba(X.reshape(1, -1))[0]
         ev   = float(pv @ RUN_VALUES)
 

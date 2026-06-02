@@ -12,6 +12,8 @@ Improvements over v2:
   2. pitch_count_in_pa feature (median-imputed 4.0 for 2015-2020)
   3. Era encoding   (era_shift_ban, era_universal_dh, era_first_year_shift_ban)
   4. batter_id / pitcher_id retained in output
+  5. Pitcher FIP features: pitcher_fip, pitcher_k_rate, pitcher_bb_rate, pitcher_hr_rate
+     (rolling 30-game window, anti-leakage shift)
 
 Usage:
     .venv/Scripts/python scripts/build_gold_v3.py [--output-path ...]
@@ -513,6 +515,104 @@ def compute_stabilized_stats(silver_with_flags: pl.DataFrame) -> pl.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Step 6b — Pitcher rolling FIP features
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CFIP_CONST  = 3.10   # calibrated for 2015-2024 MLB data
+_FIP_NEUTRAL = 4.20   # league-average fallback (insufficient data)
+_FIP_FLOOR   = 1.50
+_FIP_CEIL    = 9.00
+_FIP_MIN_PA  = 30     # minimum faced PAs before real FIP is used
+_FIP_MIN_IP  = 3.0    # minimum innings pitched before real FIP is used
+
+
+def compute_pitcher_fip_features(silver: pl.DataFrame, n_games: int = 30) -> pl.DataFrame:
+    """Compute rolling FIP and rate stats per (pitcher_id, game_date).
+
+    Anti-leakage: shift(1) ensures each row uses only games strictly before
+    game_date. Neutral league-average values are used when a pitcher has fewer
+    than _FIP_MIN_PA PAs in the rolling window.
+
+    Returns one row per (pitcher_id, game_date) with columns:
+        pitcher_fip, pitcher_k_rate, pitcher_bb_rate, pitcher_hr_rate
+    """
+    t0 = time.time()
+    print("Computing pitcher FIP features...")
+
+    # Per-PA pitcher outcome flags using the 8-class pa_outcome_idx
+    df = silver.with_columns([
+        (pl.col("pa_outcome_idx") == 1).cast(pl.Int32).alias("p_k"),
+        (pl.col("pa_outcome_idx") == 2).cast(pl.Int32).alias("p_bb"),
+        (pl.col("pa_outcome_idx") == 6).cast(pl.Int32).alias("p_hr"),
+        (pl.col("pa_outcome_idx") == 0).cast(pl.Int32).alias("p_out"),
+        (pl.col("pa_outcome_idx") == 7).cast(pl.Int32).alias("p_dp"),
+    ])
+
+    # Aggregate to (pitcher_id, game_date) grain
+    daily = (
+        df.group_by(["pitcher_id", "game_date"])
+        .agg([
+            pl.col("p_k").sum(),
+            pl.col("p_bb").sum(),
+            pl.col("p_hr").sum(),
+            pl.col("p_out").sum(),
+            pl.col("p_dp").sum(),
+            pl.len().alias("p_pa"),
+        ])
+        .sort(["pitcher_id", "game_date"])
+    )
+
+    # Shift(1) anti-leakage then rolling sum over last n_games
+    stat_cols = ["p_k", "p_bb", "p_hr", "p_out", "p_dp", "p_pa"]
+    daily = daily.with_columns([
+        pl.col(c).shift(1, fill_value=0).over("pitcher_id").alias(f"s_{c}")
+        for c in stat_cols
+    ])
+    daily = daily.with_columns([
+        pl.col(f"s_{c}").rolling_sum(n_games, min_periods=1).over("pitcher_id").alias(f"r_{c}")
+        for c in stat_cols
+    ])
+
+    # Total outs and innings pitched
+    daily = daily.with_columns(
+        (pl.col("r_p_out") + pl.col("r_p_k") + 2 * pl.col("r_p_dp")).alias("r_outs")
+    ).with_columns(
+        (pl.col("r_outs") / 3.0).alias("r_ip")
+    )
+
+    # Sufficient data gate
+    enough = (pl.col("r_ip") >= _FIP_MIN_IP) & (pl.col("r_p_pa") >= _FIP_MIN_PA)
+
+    daily = daily.with_columns([
+        pl.when(enough).then(
+            (
+                (13 * pl.col("r_p_hr") + 3 * pl.col("r_p_bb") - 2 * pl.col("r_p_k"))
+                / pl.col("r_ip").clip(lower_bound=0.33) + _CFIP_CONST
+            ).clip(lower_bound=_FIP_FLOOR, upper_bound=_FIP_CEIL)
+        ).otherwise(_FIP_NEUTRAL).cast(pl.Float32).alias("pitcher_fip"),
+
+        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
+            pl.col("r_p_k").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
+        ).otherwise(0.224).cast(pl.Float32).alias("pitcher_k_rate"),
+
+        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
+            pl.col("r_p_bb").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
+        ).otherwise(0.083).cast(pl.Float32).alias("pitcher_bb_rate"),
+
+        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
+            pl.col("r_p_hr").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
+        ).otherwise(0.033).cast(pl.Float32).alias("pitcher_hr_rate"),
+    ])
+
+    result = daily.select([
+        "pitcher_id", "game_date",
+        "pitcher_fip", "pitcher_k_rate", "pitcher_bb_rate", "pitcher_hr_rate",
+    ])
+    print(f"  Pitcher FIP: {len(result):,} (pitcher, date) rows  [{time.time()-t0:.1f}s]")
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Step 7 — Era encoding + categorical encoding
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -600,6 +700,18 @@ def build(output_path: Path) -> None:
     stab = compute_stabilized_stats(silver)
     silver = silver.join(stab, on=["batter_id", "game_date"], how="left")
 
+    # ── 6b. Pitcher FIP features ────────────────────────────────────────────
+    print("\n=== Step 6b: Pitcher FIP features ===")
+    pitcher_fip_df = compute_pitcher_fip_features(silver)
+    silver = silver.join(pitcher_fip_df, on=["pitcher_id", "game_date"], how="left")
+    # Fill nulls for pitchers with no prior Silver history (new pitchers, first game)
+    silver = silver.with_columns([
+        pl.col("pitcher_fip").fill_null(_FIP_NEUTRAL).cast(pl.Float32),
+        pl.col("pitcher_k_rate").fill_null(0.224).cast(pl.Float32),
+        pl.col("pitcher_bb_rate").fill_null(0.083).cast(pl.Float32),
+        pl.col("pitcher_hr_rate").fill_null(0.033).cast(pl.Float32),
+    ])
+
     # ── 7. Era features + categorical encoding ──────────────────────────────
     print("\n=== Step 6: Era features + categorical encoding ===")
     silver = add_era_features(silver)
@@ -623,7 +735,9 @@ def build(output_path: Path) -> None:
     stab_cols = [c for c in silver.columns if
                  "_stabilized" in c or "_shrinkage_b" in c]
 
-    final_cols = id_cols + label_col + raw_cols + rolling_cols + stab_cols + era_cols
+    fip_cols  = ["pitcher_fip", "pitcher_k_rate", "pitcher_bb_rate", "pitcher_hr_rate"]
+
+    final_cols = id_cols + label_col + raw_cols + rolling_cols + stab_cols + era_cols + fip_cols
 
     # Keep only columns that actually exist in the DataFrame
     final_cols = [c for c in final_cols if c in silver.columns]

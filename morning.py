@@ -296,6 +296,17 @@ def _recalibrate_mc_scale() -> None:
     if today_dt.weekday() != 0:   # solo lunes
         return
 
+    # Retirado para modelos calibrados: scale == 1.0 es el sentinel de que el
+    # modelo pasó el gate de prior drift (train_v3.py) y no usa parche post-hoc.
+    # Recalibrar aquí reintroduciría el sesgo que el retrain eliminó (el cap
+    # 0.95 deflactaría TODAS las predicciones un 5%).
+    pt_src = (ROOT / "predict_tonight.py").read_text(encoding="utf-8")
+    import re as _re
+    _m0 = _re.search(r"_MC_RUNS_SCALE:\s*float\s*=\s*([\d.]+)", pt_src)
+    if _m0 and abs(float(_m0.group(1)) - 1.0) < 1e-9:
+        print("  Auto-calibracion _MC_RUNS_SCALE omitida: modelo calibrado (scale=1.0).\n")
+        return
+
     print(f"{SEP}")
     print("  AUTO-CALIBRACION _MC_RUNS_SCALE")
     print(SEP)

@@ -1,0 +1,472 @@
+{
+  "report_date": "2026-06-07",
+  "game_date": "2026-06-06",
+  "generated_at": "2026-06-07T09:04:10.541111+00:00",
+  "games": [
+    {
+      "game_pk": 824269,
+      "away_team": "Seattle Mariners",
+      "home_team": "Detroit Tigers",
+      "status": "Final",
+      "actual": {
+        "away_runs": 4,
+        "home_runs": 0
+      },
+      "predictions": [
+        {
+          "team": "Detroit Tigers",
+          "side": "home",
+          "expected_runs_per_game": 5.29
+        },
+        {
+          "team": "Seattle Mariners",
+          "side": "away",
+          "expected_runs_per_game": 5.47
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Seattle Mariners",
+        "actual_winner": "Seattle Mariners",
+        "correct": true,
+        "actual_runs": {
+          "Seattle Mariners": 4,
+          "Detroit Tigers": 0
+        }
+      }
+    },
+    {
+      "game_pk": 823697,
+      "away_team": "Kansas City Royals",
+      "home_team": "Minnesota Twins",
+      "status": "Final",
+      "actual": {
+        "away_runs": 3,
+        "home_runs": 2
+      },
+      "predictions": [
+        {
+          "team": "Kansas City Royals",
+          "side": "away",
+          "expected_runs_per_game": 3.84
+        },
+        {
+          "team": "Minnesota Twins",
+          "side": "home",
+          "expected_runs_per_game": 4.72
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Minnesota Twins",
+        "actual_winner": "Kansas City Royals",
+        "correct": false,
+        "actual_runs": {
+          "Kansas City Royals": 3,
+          "Minnesota Twins": 2
+        }
+      }
+    },
+    {
+      "game_pk": 823048,
+      "away_team": "Cincinnati Reds",
+      "home_team": "St. Louis Cardinals",
+      "status": "Final",
+      "actual": {
+        "away_runs": 5,
+        "home_runs": 6
+      },
+      "predictions": [
+        {
+          "team": "Cincinnati Reds",
+          "side": "away",
+          "expected_runs_per_game": 5.3
+        },
+        {
+          "team": "St. Louis Cardinals",
+          "side": "home",
+          "expected_runs_per_game": 4.13
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Cincinnati Reds",
+        "actual_winner": "St. Louis Cardinals",
+        "correct": false,
+        "actual_runs": {
+          "Cincinnati Reds": 5,
+          "St. Louis Cardinals": 6
+        }
+      }
+    },
+    {
+      "game_pk": 824669,
+      "away_team": "San Francisco Giants",
+      "home_team": "Chicago Cubs",
+      "status": "Final",
+      "actual": {
+        "away_runs": 2,
+        "home_runs": 3
+      },
+      "predictions": [
+        {
+          "team": "Chicago Cubs",
+          "side": "home",
+          "expected_runs_per_game": 4.86
+        },
+        {
+          "team": "San Francisco Giants",
+          "side": "away",
+          "expected_runs_per_game": 3.44
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Chicago Cubs",
+        "actual_winner": "Chicago Cubs",
+        "correct": true,
+        "actual_runs": {
+          "San Francisco Giants": 2,
+          "Chicago Cubs": 3
+        }
+      }
+    },
+    {
+      "game_pk": 822808,
+      "away_team": "Baltimore Orioles",
+      "home_team": "Toronto Blue Jays",
+      "status": "Final",
+      "actual": {
+        "away_runs": 4,
+        "home_runs": 6
+      },
+      "predictions": [
+        {
+          "team": "Baltimore Orioles",
+          "side": "away",
+          "expected_runs_per_game": 4.1
+        },
+        {
+          "team": "Toronto Blue Jays",
+          "side": "home",
+          "expected_runs_per_game": 3.5
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Baltimore Orioles",
+        "actual_winner": "Toronto Blue Jays",
+        "correct": false,
+        "actual_runs": {
+          "Baltimore Orioles": 4,
+          "Toronto Blue Jays": 6
+        }
+      }
+    },
+    {
+      "game_pk": 823454,
+      "away_team": "Chicago White Sox",
+      "home_team": "Philadelphia Phillies",
+      "status": "Final",
+      "actual": {
+        "away_runs": 6,
+        "home_runs": 3
+      },
+      "predictions": [
+        {
+          "team": "Chicago White Sox",
+          "side": "away",
+          "expected_runs_per_game": 4.25
+        },
+        {
+          "team": "Philadelphia Phillies",
+          "side": "home",
+          "expected_runs_per_game": 5.98
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Philadelphia Phillies",
+        "actual_winner": "Chicago White Sox",
+        "correct": false,
+        "actual_runs": {
+          "Chicago White Sox": 6,
+          "Philadelphia Phillies": 3
+        }
+      }
+    },
+    {
+      "game_pk": 825075,
+      "away_team": "Washington Nationals",
+      "home_team": "Arizona Diamondbacks",
+      "status": "Final",
+      "actual": {
+        "away_runs": 6,
+        "home_runs": 1
+      },
+      "predictions": [
+        {
+          "team": "Arizona Diamondbacks",
+          "side": "home",
+          "expected_runs_per_game": 4.18
+        },
+        {
+          "team": "Washington Nationals",
+          "side": "away",
+          "expected_runs_per_game": 4.74
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Washington Nationals",
+        "actual_winner": "Washington Nationals",
+        "correct": true,
+        "actual_runs": {
+          "Washington Nationals": 6,
+          "Arizona Diamondbacks": 1
+        }
+      }
+    },
+    {
+      "game_pk": 824184,
+      "away_team": "Athletics",
+      "home_team": "Houston Astros",
+      "status": "Final",
+      "actual": {
+        "away_runs": 2,
+        "home_runs": 13
+      },
+      "predictions": [
+        {
+          "team": "Athletics",
+          "side": "away",
+          "expected_runs_per_game": 5.75
+        },
+        {
+          "team": "Houston Astros",
+          "side": "home",
+          "expected_runs_per_game": 5.4
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Athletics",
+        "actual_winner": "Houston Astros",
+        "correct": false,
+        "actual_runs": {
+          "Athletics": 2,
+          "Houston Astros": 13
+        }
+      }
+    },
+    {
+      "game_pk": 824915,
+      "away_team": "Pittsburgh Pirates",
+      "home_team": "Atlanta Braves",
+      "status": "Final",
+      "actual": {
+        "away_runs": 3,
+        "home_runs": 6
+      },
+      "predictions": [
+        {
+          "team": "Atlanta Braves",
+          "side": "home",
+          "expected_runs_per_game": 4.52
+        },
+        {
+          "team": "Pittsburgh Pirates",
+          "side": "away",
+          "expected_runs_per_game": 4.91
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Pittsburgh Pirates",
+        "actual_winner": "Atlanta Braves",
+        "correct": false,
+        "actual_runs": {
+          "Pittsburgh Pirates": 3,
+          "Atlanta Braves": 6
+        }
+      }
+    },
+    {
+      "game_pk": 823859,
+      "away_team": "Tampa Bay Rays",
+      "home_team": "Miami Marlins",
+      "status": "Final",
+      "actual": {
+        "away_runs": 3,
+        "home_runs": 4
+      },
+      "predictions": [
+        {
+          "team": "Miami Marlins",
+          "side": "home",
+          "expected_runs_per_game": 3.93
+        },
+        {
+          "team": "Tampa Bay Rays",
+          "side": "away",
+          "expected_runs_per_game": 3.82
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Miami Marlins",
+        "actual_winner": "Miami Marlins",
+        "correct": true,
+        "actual_runs": {
+          "Tampa Bay Rays": 3,
+          "Miami Marlins": 4
+        }
+      }
+    },
+    {
+      "game_pk": 822891,
+      "away_team": "Cleveland Guardians",
+      "home_team": "Texas Rangers",
+      "status": "Final",
+      "actual": {
+        "away_runs": 6,
+        "home_runs": 0
+      },
+      "predictions": [
+        {
+          "team": "Cleveland Guardians",
+          "side": "away",
+          "expected_runs_per_game": 4.05
+        },
+        {
+          "team": "Texas Rangers",
+          "side": "home",
+          "expected_runs_per_game": 4.75
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Texas Rangers",
+        "actual_winner": "Cleveland Guardians",
+        "correct": false,
+        "actual_runs": {
+          "Cleveland Guardians": 6,
+          "Texas Rangers": 0
+        }
+      }
+    },
+    {
+      "game_pk": 824351,
+      "away_team": "Milwaukee Brewers",
+      "home_team": "Colorado Rockies",
+      "status": "Final",
+      "actual": {
+        "away_runs": 7,
+        "home_runs": 1
+      },
+      "predictions": [
+        {
+          "team": "Colorado Rockies",
+          "side": "home",
+          "expected_runs_per_game": 3.49
+        },
+        {
+          "team": "Milwaukee Brewers",
+          "side": "away",
+          "expected_runs_per_game": 6.3
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Milwaukee Brewers",
+        "actual_winner": "Milwaukee Brewers",
+        "correct": true,
+        "actual_runs": {
+          "Milwaukee Brewers": 7,
+          "Colorado Rockies": 1
+        }
+      }
+    },
+    {
+      "game_pk": 823942,
+      "away_team": "Los Angeles Angels",
+      "home_team": "Los Angeles Dodgers",
+      "status": "Final",
+      "actual": {
+        "away_runs": 2,
+        "home_runs": 9
+      },
+      "predictions": [
+        {
+          "team": "Los Angeles Angels",
+          "side": "away",
+          "expected_runs_per_game": 3.3
+        },
+        {
+          "team": "Los Angeles Dodgers",
+          "side": "home",
+          "expected_runs_per_game": 7.13
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "Los Angeles Dodgers",
+        "actual_winner": "Los Angeles Dodgers",
+        "correct": true,
+        "actual_runs": {
+          "Los Angeles Angels": 2,
+          "Los Angeles Dodgers": 9
+        }
+      }
+    },
+    {
+      "game_pk": 823292,
+      "away_team": "New York Mets",
+      "home_team": "San Diego Padres",
+      "status": "Final",
+      "actual": {
+        "away_runs": 2,
+        "home_runs": 3
+      },
+      "predictions": [
+        {
+          "team": "New York Mets",
+          "side": "away",
+          "expected_runs_per_game": 5.74
+        },
+        {
+          "team": "San Diego Padres",
+          "side": "home",
+          "expected_runs_per_game": 3.26
+        }
+      ],
+      "comparison": {
+        "predicted_winner": "New York Mets",
+        "actual_winner": "San Diego Padres",
+        "correct": false,
+        "actual_runs": {
+          "New York Mets": 2,
+          "San Diego Padres": 3
+        }
+      }
+    },
+    {
+      "game_pk": 823539,
+      "away_team": "Boston Red Sox",
+      "home_team": "New York Yankees",
+      "status": "Postponed",
+      "actual": {
+        "away_runs": null,
+        "home_runs": null
+      },
+      "predictions": [
+        {
+          "team": "Boston Red Sox",
+          "side": "away",
+          "expected_runs_per_game": 3.95
+        },
+        {
+          "team": "New York Yankees",
+          "side": "home",
+          "expected_runs_per_game": 4.36
+        }
+      ],
+      "comparison": {}
+    }
+  ],
+  "summary": {
+    "total_games": 15,
+    "games_with_predictions": 15,
+    "games_with_comparison": 14,
+    "correct_winner": 6,
+    "incorrect_winner": 8,
+    "accuracy": 0.429
+  }
+}

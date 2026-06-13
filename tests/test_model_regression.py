@@ -9,18 +9,29 @@ Criteria:
   - Brier Score must stay below baseline
   - The model must NOT be systematically over- or under-confident
     (ECE < 0.10 is required; alert if > 0.05)
-  - These tests use the backtest_results.json as ground truth;
-    if no backtest file exists, tests are skipped (not failed).
+
+Design — sólo califica predicciones del modelo ACTUAL:
+  El backtest agrega TODAS las predicciones guardadas en results/, incluidas
+  las generadas por modelos anteriores. Calificar un modelo nuevo con métricas
+  contaminadas por predicciones de un modelo retirado (o al revés) es ruido.
+  Por eso estos tests filtran los juegos a `game_date >= fecha de despliegue`
+  del modelo en producción y RECALCULAN las métricas sobre ese subconjunto.
+  Si aún no hay suficientes juegos post-despliegue, se hace SKIP (no fail):
+  el gate real y libre de leakage es el de prior-drift en train_v3.py, que
+  corre a nivel PA en cada retrain.
 """
 
+import datetime as _dt
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).parent.parent
 BACKTEST_FILE = ROOT / "reports" / "backtest" / "backtest_results.json"
+MODEL_FILE = ROOT / "models" / "at_bat_predictor.pkl"
 
 # ── Thresholds (adjust after first validated backtest run) ───────────────────
 # Upper bounds — if the model exceeds these, something degraded.
@@ -31,6 +42,49 @@ ECE_FAIL_THRESHOLD = 0.100    # > 10% ECE → hard fail
 
 # Minimum sample size for a valid test
 MIN_GAMES = 30
+
+# Reusar las MISMAS métricas que produce el backtest, para que el gate y el
+# reporte hablen exactamente el mismo idioma (idéntica convención de win_prob).
+from backtest import (  # noqa: E402
+    auc_roc as _auc_roc,
+    brier_score as _brier_score,
+    calibration_bins as _calibration_bins,
+    ece as _ece,
+    log_loss as _log_loss,
+)
+
+
+def _model_deploy_date() -> _dt.date | None:
+    """Fecha a partir de la cual una predicción la generó el modelo actual.
+
+    Fuente de verdad: campo ``trained_at`` del artefacto (lo escribe save()).
+    Fallback: mtime del .pkl de producción. Leemos ``trained_at`` sin
+    deserializar el modelo completo (evita arrastrar lightgbm/mlflow en el
+    test) — un fallo en la lectura cae al mtime, que falla-cerrado a SKIP
+    porque un checkout de git deja el mtime reciente.
+    """
+    if not MODEL_FILE.exists():
+        return None
+    try:
+        import pickle
+
+        class _StubUnpickler(pickle.Unpickler):
+            # No reconstruimos las clases del modelo: cualquier objeto no-builtin
+            # se vuelve un stub. Sólo nos interesa la string trained_at del dict.
+            def find_class(self, module, name):
+                try:
+                    return super().find_class(module, name)
+                except Exception:
+                    return type(name, (), {"__init__": lambda self, *a, **k: None})
+
+        with open(MODEL_FILE, "rb") as f:
+            payload = _StubUnpickler(f).load()
+        ts = payload.get("trained_at") if isinstance(payload, dict) else None
+        if ts:
+            return _dt.datetime.fromisoformat(ts).date()
+    except Exception:
+        pass
+    return _dt.date.fromtimestamp(os.path.getmtime(MODEL_FILE))
 
 
 @pytest.fixture(scope="module")
@@ -45,6 +99,43 @@ def backtest_data():
         return json.load(f)
 
 
+@pytest.fixture(scope="module")
+def current_model_games(backtest_data):
+    """Juegos del backtest generados por el modelo en producción actual.
+
+    Skip (no fail) si el modelo no existe o si hay menos de MIN_GAMES juegos
+    posteriores a su despliegue — el gate de calidad no puede medirse aún.
+    """
+    deploy_date = _model_deploy_date()
+    if deploy_date is None:
+        pytest.skip(f"Modelo de producción no encontrado en {MODEL_FILE}.")
+
+    games = [
+        g for g in backtest_data.get("games", [])
+        if g.get("win_probability") is not None
+        and g.get("home_won") is not None
+        and g.get("game_date", "") >= deploy_date.isoformat()
+    ]
+    if len(games) < MIN_GAMES:
+        pytest.skip(
+            f"Sólo {len(games)} juegos con game_date >= {deploy_date.isoformat()} "
+            f"(despliegue del modelo); se necesitan {MIN_GAMES}. El gate de "
+            "regresión a nivel juego se activará al acumular más predicciones "
+            "del modelo actual. El gate de prior-drift de train_v3.py ya cubre "
+            "el retrain a nivel PA."
+        )
+    return games
+
+
+@pytest.fixture(scope="module")
+def current_model_predictions(current_model_games):
+    """(win_probability, home_won) sólo de juegos del modelo actual."""
+    return [
+        (float(g["win_probability"]), int(g["home_won"]))
+        for g in current_model_games
+    ]
+
+
 def test_backtest_file_has_minimum_games(backtest_data):
     """Ensure the backtest covers enough games to be statistically meaningful."""
     n_games = backtest_data.get("n_games", 0)
@@ -53,83 +144,56 @@ def test_backtest_file_has_minimum_games(backtest_data):
     )
 
 
-def test_log_loss_below_upper_bound(backtest_data):
-    """Log-Loss must not exceed the naive baseline."""
-    metrics = backtest_data.get("metrics", {})
-    log_loss = metrics.get("log_loss")
-    if log_loss is None:
-        pytest.skip("log_loss not in backtest metrics")
+def test_log_loss_below_upper_bound(current_model_predictions):
+    """Log-Loss del modelo actual no debe exceder la cota superior."""
+    log_loss = _log_loss(current_model_predictions)
     assert log_loss < LOG_LOSS_MAX, (
         f"Log-Loss regression: {log_loss:.4f} >= threshold {LOG_LOSS_MAX}. "
         "Model may have degraded. Check recent code changes."
     )
 
 
-def test_brier_score_beats_random(backtest_data):
-    """Brier Score must beat random guessing (0.25)."""
-    metrics = backtest_data.get("metrics", {})
-    brier = metrics.get("brier_score")
-    if brier is None:
-        pytest.skip("brier_score not in backtest metrics")
+def test_brier_score_beats_random(current_model_predictions):
+    """Brier Score del modelo actual debe ganarle al azar (0.25)."""
+    brier = _brier_score(current_model_predictions)
     assert brier < BRIER_SCORE_MAX, (
         f"Brier Score regression: {brier:.4f} >= threshold {BRIER_SCORE_MAX}. "
         "Model may have degraded."
     )
 
 
-def test_ece_calibration_within_alert_threshold(backtest_data):
-    """ECE must be below the alert threshold (5%)."""
-    metrics = backtest_data.get("metrics", {})
-    ece = metrics.get("ece")
-    if ece is None:
-        pytest.skip("ECE not in backtest metrics")
-    assert ece < ECE_FAIL_THRESHOLD, (
-        f"ECE HARD FAIL: {ece:.4f} >= {ECE_FAIL_THRESHOLD}. Calibration severely degraded."
+def test_ece_calibration_within_alert_threshold(current_model_predictions):
+    """ECE del modelo actual debe estar bajo el umbral de fallo (10%)."""
+    ece_val = _ece(_calibration_bins(current_model_predictions))
+    assert ece_val < ECE_FAIL_THRESHOLD, (
+        f"ECE HARD FAIL: {ece_val:.4f} >= {ECE_FAIL_THRESHOLD}. Calibration severely degraded."
     )
-    if ece > ECE_ALERT_THRESHOLD:
-        pytest.warns(
-            UserWarning,
-            match="ECE drift",
-        )
+    if ece_val > ECE_ALERT_THRESHOLD:
         import warnings
         warnings.warn(
-            f"ECE drift warning: {ece:.4f} > {ECE_ALERT_THRESHOLD}. "
+            f"ECE drift warning: {ece_val:.4f} > {ECE_ALERT_THRESHOLD}. "
             "Monitor calibration — may need recalibration.",
             UserWarning,
         )
 
 
-def test_auc_beats_coin_flip(backtest_data):
-    """AUC ROC must be above 0.5 (better than random)."""
-    metrics = backtest_data.get("metrics", {})
-    auc = metrics.get("auc_roc")
-    if auc is None:
-        pytest.skip("auc_roc not in backtest metrics")
+def test_auc_beats_coin_flip(current_model_predictions):
+    """AUC ROC del modelo actual debe superar 0.5 (mejor que el azar)."""
+    auc = _auc_roc(current_model_predictions)
     assert auc > 0.50, f"AUC ROC {auc:.4f} <= 0.50 — model is no better than random."
     assert auc > 0.52, (
         f"AUC ROC {auc:.4f} is barely above random. Minimal predictive power."
     )
 
 
-def test_predictions_are_not_degenerate(backtest_data):
+def test_predictions_are_not_degenerate(current_model_games):
     """
     Verify predictions don't cluster near 0.5 (which would be safe but useless)
     or near 0.0/1.0 (overconfident).
 
     A useful model has variance in its predictions.
     """
-    games = backtest_data.get("games", [])
-    if not games:
-        pytest.skip("No game records in backtest file")
-
-    probs = [
-        g["win_probability"]
-        for g in games
-        if g.get("win_probability") is not None
-    ]
-    if len(probs) < MIN_GAMES:
-        pytest.skip(f"Only {len(probs)} predictions — need {MIN_GAMES}")
-
+    probs = [g["win_probability"] for g in current_model_games]
     mean_prob = sum(probs) / len(probs)
     variance = sum((p - mean_prob) ** 2 for p in probs) / len(probs)
     std_dev = math.sqrt(variance)

@@ -713,31 +713,46 @@ class AtBatPredictor:
             X: Full feature matrix, shape (N, D). Must be sorted by time_index.
             y: Labels, shape (N,).
             time_index: Integer season/date index for each sample, shape (N,).
-                Used by TimeSeriesSplit to create non-overlapping folds.
+                Folds are built over the UNIQUE sorted values of this index so
+                that a temporal period (e.g. a season) is never split across
+                train and validation, regardless of row counts per period.
 
         Returns:
             List of per-fold metric dicts.
+
+        Raises:
+            ValueError: If X is not sorted by time_index (temporal CV would
+                silently mix past and future otherwise).
         """
+        time_index = np.asarray(time_index)
+        if np.any(np.diff(time_index) < 0):
+            raise ValueError("X/y must be sorted by time_index for temporal CV.")
+
+        # Split over unique time periods, then map back to row indices.
+        periods = np.unique(time_index)
         tscv = TimeSeriesSplit(
             n_splits=self.config.cv_n_splits,
             gap=0,
         )
         fold_results = []
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+        for fold, (train_p_idx, val_p_idx) in enumerate(tscv.split(periods)):
+            train_periods = periods[train_p_idx]
+            val_periods   = periods[val_p_idx]
+            train_idx = np.flatnonzero(np.isin(time_index, train_periods))
+            val_idx   = np.flatnonzero(np.isin(time_index, val_periods))
             log.info("cv_fold_start", fold=fold, train_size=len(train_idx), val_size=len(val_idx))
             fold_predictor = AtBatPredictor(self.config)
             # Split val into two disjoint temporal halves:
-            #   cal_idx  → calibration set  (passed to fit() as X_cal)
-            #   eval_idx → evaluation set   (passed as X_val for early-stopping signal
-            #               AND used independently for the final ECE metric)
+            #   cal_idx  → tuning set: early stopping + isotonic calibration
+            #   eval_idx → VIRGIN holdout: only read once, in evaluate_calibration
             mid = len(val_idx) // 2
             cal_idx, eval_idx = val_idx[:mid], val_idx[mid:]
 
             fold_predictor.fit(
                 X[train_idx], y[train_idx],     # training data
-                X[eval_idx],  y[eval_idx],       # X_val  — early stopping + holdout ECE
-                X[cal_idx],   y[cal_idx],         # X_cal  — isotonic calibration (separate)
+                X[cal_idx],   y[cal_idx],        # X_val — early stopping (tuning half)
+                X[cal_idx],   y[cal_idx],        # X_cal — isotonic calibration (same half)
             )
             metrics = fold_predictor.evaluate_calibration(X[eval_idx], y[eval_idx])
             metrics["fold"] = fold
@@ -813,12 +828,16 @@ class AtBatPredictor:
         """
         self._assert_fitted()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime, timezone
         payload = {
             "calibrated_model": self._calibrated_model,
             "base_model": self._base_model,
             "config": self.config,
             "feature_names": self._feature_names,
             "n_features": self._n_features,
+            # Fecha de despliegue: fuente de verdad para los gates de regresión,
+            # que solo deben calificar predicciones generadas con ESTE modelo.
+            "trained_at": datetime.now(timezone.utc).isoformat(),
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1069,9 +1088,12 @@ def main(argv: list[str] | None = None) -> None:
         label_col = "pa_outcome_idx"
         # Exclude per-PA Statcast outcome metrics: these are derived FROM the PA being
         # predicted and introduce target leakage, making the model unusable for inference.
+        # pitch_count_in_pa and last_pitch_type are intra-PA information (only known
+        # once the PA ends) — same leakage class as xwoba.
         # Also exclude identifier columns (batter_id, pitcher_id) that are not predictive
         # features (they are high-cardinality IDs, not numeric features).
-        _LEAKING = {"xwoba", "launch_speed", "launch_angle"}
+        _LEAKING = {"xwoba", "launch_speed", "launch_angle",
+                    "pitch_count_in_pa", "last_pitch_type"}
         _NON_FEATURES = {"batter_id", "pitcher_id", label_col, "season", "game_date"}
         feature_cols = [
             c for c in df.columns
@@ -1093,9 +1115,12 @@ def main(argv: list[str] | None = None) -> None:
         X_val = val_df_sorted[mid:].select(feature_cols).to_numpy().astype(np.float32)
         y_val = val_df_sorted[mid:][label_col].to_numpy().astype(np.int32)
 
+        # class_weight=None: el modelo alimenta un simulador que consume las
+        # probabilidades como pesos estocásticos — upweighting de clases raras
+        # sesga E[R]. Ver train_v3.py (gate de prior drift).
         config = AtBatModelConfig(
             mlflow_experiment=args.experiment,
-            class_weight=LOG_SCALED_CLASS_WEIGHTS,
+            class_weight=None,
         )
         predictor = AtBatPredictor(config)
         predictor.fit(

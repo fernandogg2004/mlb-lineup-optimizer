@@ -1,6 +1,11 @@
 """
-build_gold.py
+build_gold.py  [DEPRECATED — usar scripts/build_gold_v3.py]
 =============
+ATENCIÓN: este pipeline v2 está deprecado. El Gold de entrenamiento activo es
+features_train_v3.parquet, generado por scripts/build_gold_v3.py (8 clases,
+features compartidas con serving via src/features/shared_features.py).
+Se conserva solo como referencia histórica; no reentrenar con su salida.
+
 Reconstruye el parquet de features de entrenamiento (Gold) a partir de
 todos los Silver disponibles.
 
@@ -61,11 +66,28 @@ def load_silver() -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _build_daily(silver: pl.DataFrame) -> pl.DataFrame:
-    """Agrega al grano diario (1 fila por batter × game_date)."""
+    """Agrega al grano diario (1 fila por batter × game_date).
+
+    Re-agrega tras _aggregate_to_daily porque esa función agrupa también por
+    batter_stand: los switch hitters producían DOS filas por fecha y el join
+    posterior por (batter_id, game_date) duplicaba PAs en el Gold.
+    """
     from src.features.features_rolling import _add_pa_event_flags, _aggregate_to_daily
-    return (
+    daily = (
         _aggregate_to_daily(_add_pa_event_flags(silver.lazy()))
         .collect()
+    )
+    return (
+        daily.group_by(["batter_id", "game_date", "season"])
+        .agg([
+            pl.col("pa").sum(), pl.col("k").sum(), pl.col("bb").sum(),
+            pl.col("hr").sum(), pl.col("hits").sum(),
+            pl.col("hard_hits").sum(), pl.col("bip").sum(),
+            # Media ponderada aproximada de las métricas por-juego
+            pl.col("xwoba_mean").drop_nulls().mean(),
+            pl.col("launch_speed_mean").drop_nulls().mean(),
+            pl.col("launch_angle_mean").drop_nulls().mean(),
+        ])
         .sort(["batter_id", "game_date"])
     )
 
@@ -254,7 +276,13 @@ def _build_platoon_stabilized(silver: pl.DataFrame) -> pl.DataFrame:
         "babip_stabilized", "babip_shrinkage_b",
         "iso_stabilized", "iso_shrinkage_b",
     ]
-    return flags.select(keep)
+    # Una fila por (batter, mano, fecha): el primer registro del día = stats al
+    # inicio del juego. Sin esto el join PA-level era m:n y duplicaba filas.
+    return (
+        flags.select(keep)
+        .group_by(["batter_id", "pitcher_throws", "game_date"], maintain_order=True)
+        .first()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +313,10 @@ def _add_outcome_idx(silver: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_gold(output_path: Path) -> None:
+    print("=" * 70)
+    print("  DEPRECATED: build_gold.py (v2) — usa scripts/build_gold_v3.py")
+    print("  El modelo en producción se entrena con features_train_v3.parquet.")
+    print("=" * 70, flush=True)
     print("\n[1/6] Cargando Silver...", flush=True)
     silver = load_silver()
 

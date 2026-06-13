@@ -99,3 +99,21 @@ PARK_FACTORS: dict[str, dict[str, float]] = {
     "395": {"hr": 0.93, "xb": 0.97},    # Tropicana Field (TB) — techo
     "31": {"hr": 0.94, "xb": 0.98},     # Kauffman Stadium (KC)
 }
+
+# Park factors indexados por abreviatura Statcast del HOME team (la columna
+# home_team del Silver identifica el estadio). Para training histórico: el
+# equipo juega en su estadio habitual; sedes especiales (London Series,
+# Field of Dreams, etc.) son <0.5% de los juegos y quedan en su factor base.
+# Equipos no listados → neutral (hr=1.0, xb=1.0).
+PARK_FACTORS_BY_TEAM: dict[str, dict[str, float]] = {
+    "COL": PARK_FACTORS["3313"],
+    "CIN": PARK_FACTORS["32"],
+    "TEX": PARK_FACTORS["4705"],
+    "NYY": PARK_FACTORS["5325"],
+    "CHC": PARK_FACTORS["2392"],
+    "SD":  PARK_FACTORS["4169"],
+    "LAD": PARK_FACTORS["14"],
+    "SF":  PARK_FACTORS["680"],
+    "TB":  PARK_FACTORS["395"],
+    "KC":  PARK_FACTORS["31"],
+}

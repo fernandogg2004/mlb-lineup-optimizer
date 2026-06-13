@@ -116,11 +116,27 @@ def _to_silver(raw: pl.DataFrame, year: int) -> pl.DataFrame:
         "batter", "pitcher", "game_date", "stand", "p_throws",
         "pitch_type", "events", "bb_type",
         "estimated_woba_using_speedangle", "launch_speed", "launch_angle",
+        # Contexto de juego: clave natural de PA + venue/home para park factors
+        "game_pk", "at_bat_number", "home_team", "away_team", "inning_topbot",
     }
     available = set(raw.columns)
     missing = needed - available
     if missing:
         print(f"  ADVERTENCIA: columnas faltantes en {year}: {missing}", flush=True)
+
+    has_context = {"game_pk", "at_bat_number"} <= available
+
+    # pitch_count_in_pa exacto: pitches por (game_pk, at_bat_number) del raw
+    # pitch-level ANTES de filtrar a PA-ending rows.
+    if has_context:
+        pitch_counts = (
+            raw.group_by(["game_pk", "at_bat_number"])
+            .agg(pl.len().cast(pl.Int32).alias("pitch_count_in_pa"))
+            .with_columns([
+                pl.col("game_pk").cast(pl.Int64),
+                pl.col("at_bat_number").cast(pl.Int32),
+            ])
+        )
 
     # Filtrar solo pitches que terminan una PA
     df = raw.filter(
@@ -155,11 +171,25 @@ def _to_silver(raw: pl.DataFrame, year: int) -> pl.DataFrame:
             else pl.lit(None).cast(pl.Float32).alias("launch_speed"),
             pl.col("launch_angle").cast(pl.Float32) if "launch_angle" in available
             else pl.lit(None).cast(pl.Float32).alias("launch_angle"),
+            # Contexto de juego (clave PA determinista + park factors + home/away)
+            (pl.col("game_pk").cast(pl.Int64) if "game_pk" in available
+             else pl.lit(None).cast(pl.Int64)).alias("game_pk"),
+            (pl.col("at_bat_number").cast(pl.Int32) if "at_bat_number" in available
+             else pl.lit(None).cast(pl.Int32)).alias("at_bat_number"),
+            (pl.col("home_team").cast(pl.Utf8) if "home_team" in available
+             else pl.lit(None).cast(pl.Utf8)).alias("home_team"),
+            (pl.col("away_team").cast(pl.Utf8) if "away_team" in available
+             else pl.lit(None).cast(pl.Utf8)).alias("away_team"),
+            # Batter es home team cuando batea en la parte baja del inning
+            ((pl.col("inning_topbot") == "Bot").cast(pl.Int8)
+             if "inning_topbot" in available
+             else pl.lit(None).cast(pl.Int8)).alias("is_home"),
         ])
         .select([
             "batter_id", "pitcher_id", "game_date", "season",
             "batter_stand", "pitcher_throws", "last_pitch_type",
             "pa_result", "hit_type", "xwoba", "launch_speed", "launch_angle",
+            "game_pk", "at_bat_number", "home_team", "away_team", "is_home",
         ])
         # pa_outcome_int: mapeado en Python (es pequeño con map_elements)
         .with_columns(
@@ -169,6 +199,14 @@ def _to_silver(raw: pl.DataFrame, year: int) -> pl.DataFrame:
         )
         .drop_nulls(subset=["batter_id", "pitcher_id", "game_date"])
     )
+
+    # pitch_count_in_pa exacto via join determinista (game_pk, at_bat_number)
+    if has_context:
+        silver = silver.join(pitch_counts, on=["game_pk", "at_bat_number"], how="left")
+    else:
+        silver = silver.with_columns(
+            pl.lit(None).cast(pl.Int32).alias("pitch_count_in_pa")
+        )
 
     return silver
 

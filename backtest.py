@@ -170,15 +170,21 @@ def run_backtest(
     actuals_cache = _load_comparison_actuals()
     print(f"  Loaded {len(actuals_cache)} game results from comparison files.")
 
-    # Collect all prediction files
-    all_files = sorted(RESULTS_DIR.glob("*_2*.json"))
+    # Collect all prediction files: estructura plana legacy (ABBR_fecha.json)
+    # + estructura nueva por subdirectorio (results/<fecha>/<ABBR>.json)
+    all_files = sorted(RESULTS_DIR.glob("*_2*.json")) + sorted(RESULTS_DIR.glob("2*/*.json"))
     print(f"  Found {len(all_files)} prediction files.")
+
+    def _file_date(fp: Path) -> str:
+        if fp.parent != RESULTS_DIR:
+            return fp.parent.name          # results/<fecha>/<ABBR>.json
+        return fp.stem.split("_")[-1]      # results/<ABBR>_<fecha>.json
 
     # Filter by date if requested
     if date_single:
-        all_files = [f for f in all_files if date_single in f.name]
+        all_files = [f for f in all_files if _file_date(f) == date_single]
     elif date_from:
-        all_files = [f for f in all_files if f.stem.split("_")[-1] >= date_from]
+        all_files = [f for f in all_files if _file_date(f) >= date_from]
 
     # Group by game_pk (one prediction per team per game — deduplicate to home side)
     game_preds: dict[int, dict] = {}

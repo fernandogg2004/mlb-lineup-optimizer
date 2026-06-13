@@ -47,23 +47,11 @@ GIDP_EVENTS = {"grounded_into_double_play", "strikeout_double_play", "double_pla
 # Seasons where raw Statcast is available (for GIDP + pitch_count)
 RAW_SEASONS = {2021, 2022, 2023, 2024}
 
-# Pitch count imputation: calculado por temporada desde datos reales (RAW_SEASONS).
-# Pre-RAW seasons usan el valor de la primera temporada RAW disponible como proxy.
-# Se rellena en build() tras cargar Silver; el fallback es 4.0 (mediana global).
-PITCH_COUNT_IMPUTE: float = 4.0        # fallback global si Silver no disponible
-_PC_IMPUTE_BY_SEASON: dict[int, float] = {}   # rellenado en compute_pitch_count_imputes()
-
-# Stabilization thresholds and league priors — imported from central constants.
-from src.constants import STAB_T as STABILIZE_T, LEAGUE_AVG as _LEAGUE_PRIORS_RAW  # noqa: E402
-
-# Remap keys to the "short" form used internally in this file
-LEAGUE_PRIORS = {
-    "woba":  _LEAGUE_PRIORS_RAW["woba"],
-    "k":     _LEAGUE_PRIORS_RAW["k_rate"],
-    "bb":    _LEAGUE_PRIORS_RAW["bb_rate"],
-    "babip": _LEAGUE_PRIORS_RAW["babip"],
-    "iso":   _LEAGUE_PRIORS_RAW["iso"],
-}
+# Pitch count imputation para Silver legacy sin pitch_count_in_pa exacto.
+# (El schema nuevo de build_silver.py trae el conteo exacto por PA; esta
+# constante solo aplica al fallback. La feature está excluida del modelo por
+# leakage intra-PA — ver _LEAKING en train_v3.py.)
+PITCH_COUNT_IMPUTE: float = 4.0        # mediana global MLB
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -218,10 +206,26 @@ def compute_pitch_count_imputes(silver: pl.DataFrame) -> None:
 def augment_silver(silver: pl.DataFrame) -> pl.DataFrame:
     """Add is_gidp and pitch_count_in_pa to the Silver DataFrame.
 
-    For 2021-2024: uses raw Statcast (exact PA-sequence join).
-    For 2015-2020: is_gidp = False, pitch_count = PITCH_COUNT_IMPUTE.
+    Preferred path (new Silver schema with game_pk/at_bat_number): is_gidp
+    comes directly from pa_result and pitch_count_in_pa is already exact —
+    no fragile pa_seq row-order join needed.
+
+    Legacy path (old Silver): raw Statcast pa_seq join for 2021-2024,
+    PITCH_COUNT_IMPUTE for the rest.
     """
     t0 = time.time()
+
+    # ── Preferred: new Silver schema (deterministic, no pa_seq join) ─────────
+    if "pitch_count_in_pa" in silver.columns and "game_pk" in silver.columns:
+        silver = silver.with_columns([
+            pl.col("pa_result").is_in(list(GIDP_EVENTS)).alias("is_gidp"),
+            pl.col("pitch_count_in_pa")
+              .fill_null(PITCH_COUNT_IMPUTE).cast(pl.Float32)
+              .alias("pitch_count_in_pa"),
+        ])
+        print(f"Augmentation (schema nuevo, sin pa_seq)  "
+              f"GIDP rows: {silver['is_gidp'].sum():,}  [{time.time()-t0:.1f}s]")
+        return silver
 
     # Add pa_seq (0-based) within each (batter_id, pitcher_id, game_date) group.
     # We use row_index + group-min subtraction — robust across all Polars versions.
@@ -319,95 +323,22 @@ def remap_labels(silver: pl.DataFrame) -> pl.DataFrame:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 5 — Batter rolling features (7d / 15d / 30d + EWMA)
+# Implementación ÚNICA en src/features/shared_features.py (contrato anti-skew
+# con el serving — predict_tonight usa exactamente las mismas funciones).
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _add_event_flags(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns([
-        pl.lit(1).cast(pl.Int8).alias("pa_flag"),
-        pl.col("pa_result").is_in(["strikeout", "strikeout_double_play"]).cast(pl.Int8).alias("k_flag"),
-        pl.col("pa_result").is_in(["walk", "intent_walk"]).cast(pl.Int8).alias("bb_flag"),
-        (pl.col("hit_type") == "home_run").cast(pl.Int8).alias("hr_flag"),
-        pl.col("hit_type").is_in(["single", "double", "triple", "home_run"]).cast(pl.Int8).alias("hit_flag"),
-        (pl.col("launch_speed").is_not_null() & (pl.col("launch_speed") >= 95.0)).cast(pl.Int8).alias("hh_flag"),
-        (~pl.col("pa_result").is_in([
-            "walk", "intent_walk", "hit_by_pitch", "strikeout",
-            "strikeout_double_play", "sac_fly", "sac_bunt",
-        ])).cast(pl.Int8).alias("bip_flag"),
-    ])
-
-
-def _daily_grain(df: pl.DataFrame) -> pl.DataFrame:
-    """Aggregate per-PA data to (batter_id, game_date) daily grain."""
-    return (
-        df.group_by(["batter_id", "game_date", "season"])
-        .agg([
-            pl.col("pa_flag").sum().alias("pa"),
-            pl.col("k_flag").sum().alias("k"),
-            pl.col("bb_flag").sum().alias("bb"),
-            pl.col("hr_flag").sum().alias("hr"),
-            pl.col("hit_flag").sum().alias("hits"),
-            pl.col("hh_flag").sum().alias("hh"),
-            pl.col("bip_flag").sum().alias("bip"),
-            pl.col("xwoba").drop_nulls().mean().alias("xwoba_mean"),
-            pl.col("launch_speed").drop_nulls().mean().alias("ls_mean"),
-        ])
-        .sort(["batter_id", "game_date"])
-    )
-
-
-def _shift_rolling(daily: pl.DataFrame, window: int, min_pa: int, suffix: str) -> pl.DataFrame:
-    """Game-count rolling window with anti-leakage shift(1)."""
-    cols_to_shift = ["xwoba_mean", "ls_mean", "pa", "k", "bb", "hr", "hits", "hh", "bip"]
-
-    daily = daily.sort(["batter_id", "game_date"])
-
-    # Shift all columns by 1 within each batter group
-    shifts = [
-        pl.col(c).shift(1).over("batter_id").alias(f"_{c}_s")
-        for c in cols_to_shift
-    ]
-    daily = daily.with_columns(shifts)
-
-    # Rolling sum/mean over shifted values
-    min_p = max(1, min_pa)
-    daily = daily.with_columns([
-        pl.col("_pa_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"pa_{suffix}"),
-        pl.col("_k_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_k_{suffix}"),
-        pl.col("_bb_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_bb_{suffix}"),
-        pl.col("_hr_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_hr_{suffix}"),
-        pl.col("_hits_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_hits_{suffix}"),
-        pl.col("_hh_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_hh_{suffix}"),
-        pl.col("_bip_s").rolling_sum(window, min_periods=1).over("batter_id").alias(f"_bip_{suffix}"),
-        pl.col("_xwoba_mean_s").rolling_mean(window, min_periods=1).over("batter_id").alias(f"_xwoba_raw_{suffix}"),
-        pl.col("_ls_mean_s").rolling_mean(window, min_periods=1).over("batter_id").alias(f"_ls_raw_{suffix}"),
-    ])
-
-    # Apply PA gate + compute rates
-    gate = pl.col(f"pa_{suffix}") >= min_p
-    daily = daily.with_columns([
-        pl.when(gate).then(pl.col(f"_xwoba_raw_{suffix}")).otherwise(None).alias(f"xwoba_{suffix}"),
-        pl.when(gate).then(pl.col(f"_ls_raw_{suffix}")).otherwise(None).alias(f"launch_speed_{suffix}"),
-        pl.when(gate).then(
-            pl.col(f"_k_{suffix}") / pl.col(f"pa_{suffix}").clip(lower_bound=1)
-        ).otherwise(None).alias(f"k_rate_{suffix}"),
-        pl.when(gate).then(
-            pl.col(f"_bb_{suffix}") / pl.col(f"pa_{suffix}").clip(lower_bound=1)
-        ).otherwise(None).alias(f"bb_rate_{suffix}"),
-        pl.when(gate).then(
-            pl.col(f"_hr_{suffix}") / pl.col(f"pa_{suffix}").clip(lower_bound=1)
-        ).otherwise(None).alias(f"hr_rate_{suffix}"),
-        pl.when(gate).then(
-            pl.col(f"_hh_{suffix}") / pl.col(f"_bip_{suffix}").clip(lower_bound=1)
-        ).otherwise(None).alias(f"hard_hit_rate_{suffix}"),
-    ])
-
-    # Drop temp columns
-    drop_cols = [f"_{c}_s" for c in cols_to_shift] + [
-        f"_k_{suffix}", f"_bb_{suffix}", f"_hr_{suffix}",
-        f"_hits_{suffix}", f"_hh_{suffix}", f"_bip_{suffix}",
-        f"_xwoba_raw_{suffix}", f"_ls_raw_{suffix}",
-    ]
-    return daily.drop([c for c in drop_cols if c in daily.columns])
+from src.features.shared_features import (  # noqa: E402
+    PITCHER_FEATURE_COLS,
+    PLATOON_FEATURE_COLS,
+    ROLLING_FEATURE_COLS,
+    STAB_FEATURE_COLS,
+    add_event_flags,
+    add_season_stabilized,
+    add_shift_rolling,
+    daily_grain,
+    pitcher_rolling_table,
+    platoon_career_table,
+)
 
 
 def compute_rolling_features(silver: pl.DataFrame) -> pl.DataFrame:
@@ -415,34 +346,10 @@ def compute_rolling_features(silver: pl.DataFrame) -> pl.DataFrame:
     t0 = time.time()
     print("Computing rolling features...")
 
-    flagged = _add_event_flags(silver)
-    daily = _daily_grain(flagged)
-
-    # 7d window (≈ 7 games, short window)
-    daily = _shift_rolling(daily, window=7,  min_pa=3, suffix="7d")
-    # 15d window
-    daily = _shift_rolling(daily, window=15, min_pa=3, suffix="15d")
-    # 30d window
-    daily = _shift_rolling(daily, window=30, min_pa=10, suffix="30d")
-
-    # EWMA (slow α=0.2, fast α=0.5) on xwoba
-    daily = daily.with_columns([
-        pl.col("xwoba_mean").shift(1).ewm_mean(alpha=0.2, min_periods=1, adjust=True)
-            .over("batter_id").alias("xwoba_ewma_alpha02"),
-        pl.col("xwoba_mean").shift(1).ewm_mean(alpha=0.5, min_periods=1, adjust=True)
-            .over("batter_id").alias("xwoba_ewma_alpha05"),
-    ])
-
+    daily = add_shift_rolling(daily_grain(add_event_flags(silver)))
     print(f"  Daily rolling: {len(daily):,} (batter, date) rows")
 
-    # Select only the rolling feature columns for the join
-    rolling_cols = [
-        "pa_7d",  "k_rate_7d",  "bb_rate_7d",  "hr_rate_7d",  "hard_hit_rate_7d",  "xwoba_7d",  "launch_speed_7d",
-        "pa_15d", "k_rate_15d", "bb_rate_15d", "hr_rate_15d", "hard_hit_rate_15d", "xwoba_15d", "launch_speed_15d",
-        "pa_30d", "k_rate_30d", "bb_rate_30d", "hr_rate_30d", "hard_hit_rate_30d", "xwoba_30d", "launch_speed_30d",
-        "xwoba_ewma_alpha02", "xwoba_ewma_alpha05",
-    ]
-    rolling = daily.select(["batter_id", "game_date"] + rolling_cols)
+    rolling = daily.select(["batter_id", "game_date"] + ROLLING_FEATURE_COLS)
 
     # Join back to Silver (many-to-one: all PAs in same game get same rolling feats)
     result = silver.join(rolling, on=["batter_id", "game_date"], how="left")
@@ -454,197 +361,46 @@ def compute_rolling_features(silver: pl.DataFrame) -> pl.DataFrame:
 # Step 6 — Season-level stabilized statistics
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_stabilized_stats(silver_with_flags: pl.DataFrame) -> pl.DataFrame:
-    """Compute season-to-date stabilized stats using Empirical Bayes shrinkage.
+def compute_stabilized_stats(silver: pl.DataFrame) -> pl.DataFrame:
+    """Season-to-date stabilized stats (James-Stein) — shared_features.
 
-    For each batter on each game_date, we use all PAs in the current season
-    strictly before game_date to compute cumulative raw rate, then shrink
-    toward the league average using the Marcel stabilization threshold.
-
-    stat_stabilized = prior + (1 - B) × (raw - prior)
-    B = T / (T + PA_to_date)
-
-    This is intentionally conservative (uses season-to-date, not career)
-    to avoid using future data.
+    Anti-leakage: cum_sum con shift(1) dentro de (batter_id, season); ISO ahora
+    es (TB - H) / PA, idéntico en training y serving.
     """
     t0 = time.time()
     print("Computing stabilized stats...")
-
-    # We need to add event flags if not already present
-    if "k_flag" not in silver_with_flags.columns:
-        df = _add_event_flags(silver_with_flags)
-    else:
-        df = silver_with_flags
-
-    daily = _daily_grain(df)
-
-    # Season-to-date cumulative counts (anti-leakage: shifted by 1)
-    daily = daily.sort(["batter_id", "season", "game_date"])
-
-    daily = daily.with_columns([
-        pl.col("pa").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("pa_std"),
-        pl.col("k").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("k_std"),
-        pl.col("bb").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("bb_std"),
-        pl.col("hr").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("hr_std"),
-        pl.col("hits").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("hits_std"),
-        pl.col("bip").shift(1, fill_value=0).cum_sum().over(["batter_id", "season"]).alias("bip_std"),
-        pl.col("xwoba_mean").shift(1, fill_value=None)
-            .rolling_mean(window_size=200, min_periods=1)
-            .over(["batter_id", "season"]).alias("woba_raw"),
-    ])
-
-    # Compute stabilized stats and shrinkage B values
-    def _stabilize(raw_col: str, pa_col: str, T: float, prior: float, out: str) -> list:
-        B = pl.lit(T) / (pl.lit(T) + pl.col(pa_col).clip(lower_bound=0))
-        return [
-            B.alias(f"{out}_shrinkage_b"),
-            (
-                pl.lit(prior) + (1 - B) * (pl.col(raw_col) - pl.lit(prior))
-            ).alias(f"{out}_stabilized"),
-        ]
-
-    rate_cols = []
-
-    # wOBA stabilized
-    rate_cols += _stabilize("woba_raw", "pa_std", STABILIZE_T["woba"],
-                            LEAGUE_PRIORS["woba"], "woba")
-
-    # K rate stabilized
-    daily = daily.with_columns(
-        (pl.col("k_std") / pl.col("pa_std").clip(lower_bound=1)).alias("k_rate_raw")
-    )
-    rate_cols += _stabilize("k_rate_raw", "pa_std", STABILIZE_T["k"],
-                            LEAGUE_PRIORS["k"], "k_rate")
-
-    # BB rate stabilized
-    daily = daily.with_columns(
-        (pl.col("bb_std") / pl.col("pa_std").clip(lower_bound=1)).alias("bb_rate_raw")
-    )
-    rate_cols += _stabilize("bb_rate_raw", "pa_std", STABILIZE_T["bb"],
-                            LEAGUE_PRIORS["bb"], "bb_rate")
-
-    # BABIP stabilized
-    daily = daily.with_columns(
-        ((pl.col("hits_std") - pl.col("hr_std")) / pl.col("bip_std").clip(lower_bound=1)).alias("babip_raw")
-    )
-    rate_cols += _stabilize("babip_raw", "pa_std", STABILIZE_T["babip"],
-                            LEAGUE_PRIORS["babip"], "babip")
-
-    # ISO stabilized (approximated from HR rate)
-    daily = daily.with_columns(
-        (pl.col("hr_std") * 1.5 / pl.col("pa_std").clip(lower_bound=1)).alias("iso_raw")
-    )
-    rate_cols += _stabilize("iso_raw", "pa_std", STABILIZE_T["iso"],
-                            LEAGUE_PRIORS["iso"], "iso")
-
-    daily = daily.with_columns(rate_cols)
-
-    stab_cols = [
-        "woba_stabilized", "woba_shrinkage_b",
-        "k_rate_stabilized", "k_rate_shrinkage_b",
-        "bb_rate_stabilized", "bb_rate_shrinkage_b",
-        "babip_stabilized", "babip_shrinkage_b",
-        "iso_stabilized", "iso_shrinkage_b",
-    ]
-    stabilized = daily.select(["batter_id", "game_date"] + stab_cols)
+    daily = add_season_stabilized(daily_grain(add_event_flags(silver)))
+    stabilized = daily.select(["batter_id", "game_date"] + STAB_FEATURE_COLS)
     print(f"  Stabilized: {len(stabilized):,} rows [{time.time()-t0:.1f}s]")
     return stabilized
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Step 6b — Pitcher rolling FIP features
-# ──────────────────────────────────────────────────────────────────────────────
+def compute_platoon_stats(silver: pl.DataFrame) -> pl.DataFrame:
+    """Career-to-date vs mano del lanzador, James-Stein — shared_features.
 
-_CFIP_CONST  = 3.10   # calibrated for 2015-2024 MLB data
-_FIP_NEUTRAL = 4.20   # league-average fallback (insufficient data)
-_FIP_FLOOR   = 1.50
-_FIP_CEIL    = 9.00
-_FIP_MIN_PA  = 30     # minimum faced PAs before real FIP is used
-_FIP_MIN_IP  = 3.0    # minimum innings pitched before real FIP is used
+    Una fila por (batter_id, pitcher_throws, game_date): clave única, el join
+    de vuelta a PA-level no multiplica filas.
+    """
+    t0 = time.time()
+    print("Computing platoon (vs hand) stats...")
+    platoon = platoon_career_table(add_event_flags(silver))
+    print(f"  Platoon: {len(platoon):,} rows [{time.time()-t0:.1f}s]")
+    return platoon
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 6b — Pitcher rolling FIP features (shared_features, shrinkage gradual)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def compute_pitcher_fip_features(silver: pl.DataFrame, n_games: int = 30) -> pl.DataFrame:
-    """Compute rolling FIP and rate stats per (pitcher_id, game_date).
+    """Rolling FIP y rates por (pitcher_id, game_date) — shared_features.
 
-    Anti-leakage: shift(1) ensures each row uses only games strictly before
-    game_date. Neutral league-average values are used when a pitcher has fewer
-    than _FIP_MIN_PA PAs in the rolling window.
-
-    Returns one row per (pitcher_id, game_date) with columns:
-        pitcher_fip, pitcher_k_rate, pitcher_bb_rate, pitcher_hr_rate
+    Anti-leakage shift(1); shrinkage gradual hacia liga (w = PA/FIP_MIN_PA)
+    en vez del acantilado binario anterior. Misma función en serving.
     """
     t0 = time.time()
     print("Computing pitcher FIP features...")
-
-    # Per-PA pitcher outcome flags using the 8-class pa_outcome_idx
-    df = silver.with_columns([
-        (pl.col("pa_outcome_idx") == 1).cast(pl.Int32).alias("p_k"),
-        (pl.col("pa_outcome_idx") == 2).cast(pl.Int32).alias("p_bb"),
-        (pl.col("pa_outcome_idx") == 6).cast(pl.Int32).alias("p_hr"),
-        (pl.col("pa_outcome_idx") == 0).cast(pl.Int32).alias("p_out"),
-        (pl.col("pa_outcome_idx") == 7).cast(pl.Int32).alias("p_dp"),
-    ])
-
-    # Aggregate to (pitcher_id, game_date) grain
-    daily = (
-        df.group_by(["pitcher_id", "game_date"])
-        .agg([
-            pl.col("p_k").sum(),
-            pl.col("p_bb").sum(),
-            pl.col("p_hr").sum(),
-            pl.col("p_out").sum(),
-            pl.col("p_dp").sum(),
-            pl.len().alias("p_pa"),
-        ])
-        .sort(["pitcher_id", "game_date"])
-    )
-
-    # Shift(1) anti-leakage then rolling sum over last n_games
-    stat_cols = ["p_k", "p_bb", "p_hr", "p_out", "p_dp", "p_pa"]
-    daily = daily.with_columns([
-        pl.col(c).shift(1, fill_value=0).over("pitcher_id").alias(f"s_{c}")
-        for c in stat_cols
-    ])
-    daily = daily.with_columns([
-        pl.col(f"s_{c}").rolling_sum(n_games, min_periods=1).over("pitcher_id").alias(f"r_{c}")
-        for c in stat_cols
-    ])
-
-    # Total outs and innings pitched
-    daily = daily.with_columns(
-        (pl.col("r_p_out") + pl.col("r_p_k") + 2 * pl.col("r_p_dp")).alias("r_outs")
-    ).with_columns(
-        (pl.col("r_outs") / 3.0).alias("r_ip")
-    )
-
-    # Sufficient data gate
-    enough = (pl.col("r_ip") >= _FIP_MIN_IP) & (pl.col("r_p_pa") >= _FIP_MIN_PA)
-
-    daily = daily.with_columns([
-        pl.when(enough).then(
-            (
-                (13 * pl.col("r_p_hr") + 3 * pl.col("r_p_bb") - 2 * pl.col("r_p_k"))
-                / pl.col("r_ip").clip(lower_bound=0.33) + _CFIP_CONST
-            ).clip(lower_bound=_FIP_FLOOR, upper_bound=_FIP_CEIL)
-        ).otherwise(_FIP_NEUTRAL).cast(pl.Float32).alias("pitcher_fip"),
-
-        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
-            pl.col("r_p_k").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
-        ).otherwise(0.224).cast(pl.Float32).alias("pitcher_k_rate"),
-
-        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
-            pl.col("r_p_bb").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
-        ).otherwise(0.083).cast(pl.Float32).alias("pitcher_bb_rate"),
-
-        pl.when(pl.col("r_p_pa") >= _FIP_MIN_PA).then(
-            pl.col("r_p_hr").cast(pl.Float32) / pl.col("r_p_pa").cast(pl.Float32).clip(lower_bound=1)
-        ).otherwise(0.033).cast(pl.Float32).alias("pitcher_hr_rate"),
-    ])
-
-    result = daily.select([
-        "pitcher_id", "game_date",
-        "pitcher_fip", "pitcher_k_rate", "pitcher_bb_rate", "pitcher_hr_rate",
-    ])
+    result = pitcher_rolling_table(silver, n_games=n_games)
     print(f"  Pitcher FIP: {len(result):,} (pitcher, date) rows  [{time.time()-t0:.1f}s]")
     return result
 
@@ -668,6 +424,43 @@ def add_era_features(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("season") >= 2020).cast(pl.Int8).alias("era_universal_dh"),
         (pl.col("season") == 2023).cast(pl.Int8).alias("era_first_year_shift_ban"),
     ])
+
+
+def add_park_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Park factors + home/away como features de ENTRENAMIENTO.
+
+    El modelo aprende las interacciones (p.ej. Coors × fly-ball hitter) en vez
+    de recibir un multiplicador post-hoc no calibrado en serving.
+
+    Silver sin contexto (schema viejo): neutral hr/xb=1.0, is_home=0.5.
+    """
+    from src.constants import PARK_FACTORS_BY_TEAM
+
+    if "home_team" in df.columns:
+        hr_map = {t: f["hr"] for t, f in PARK_FACTORS_BY_TEAM.items()}
+        xb_map = {t: f["xb"] for t, f in PARK_FACTORS_BY_TEAM.items()}
+        # .replace con return_dtype + default (API Polars 0.20.x)
+        df = df.with_columns([
+            pl.col("home_team")
+              .replace(hr_map, default=1.0, return_dtype=pl.Float32)
+              .alias("park_factor_hr"),
+            pl.col("home_team")
+              .replace(xb_map, default=1.0, return_dtype=pl.Float32)
+              .alias("park_factor_xb"),
+        ])
+    else:
+        df = df.with_columns([
+            pl.lit(1.0).cast(pl.Float32).alias("park_factor_hr"),
+            pl.lit(1.0).cast(pl.Float32).alias("park_factor_xb"),
+        ])
+
+    if "is_home" in df.columns:
+        df = df.with_columns(
+            pl.col("is_home").cast(pl.Float32).fill_null(0.5).alias("is_home")
+        )
+    else:
+        df = df.with_columns(pl.lit(0.5).cast(pl.Float32).alias("is_home"))
+    return df
 
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
@@ -738,21 +531,30 @@ def build(output_path: Path) -> None:
     stab = compute_stabilized_stats(silver)
     silver = silver.join(stab, on=["batter_id", "game_date"], how="left")
 
+    # ── 6a. Platoon career-to-date vs mano del lanzador ─────────────────────
+    print("\n=== Step 5b: Platoon (vs hand) stats ===")
+    platoon = compute_platoon_stats(silver)
+    silver = silver.join(
+        platoon, on=["batter_id", "pitcher_throws", "game_date"], how="left"
+    )
+
     # ── 6b. Pitcher FIP features ────────────────────────────────────────────
     print("\n=== Step 6b: Pitcher FIP features ===")
+    from src.constants import FIP_NEUTRAL, LEAGUE_AVG
     pitcher_fip_df = compute_pitcher_fip_features(silver)
     silver = silver.join(pitcher_fip_df, on=["pitcher_id", "game_date"], how="left")
     # Fill nulls for pitchers with no prior Silver history (new pitchers, first game)
     silver = silver.with_columns([
-        pl.col("pitcher_fip").fill_null(_FIP_NEUTRAL).cast(pl.Float32),
-        pl.col("pitcher_k_rate").fill_null(0.224).cast(pl.Float32),
-        pl.col("pitcher_bb_rate").fill_null(0.083).cast(pl.Float32),
+        pl.col("pitcher_fip").fill_null(FIP_NEUTRAL).cast(pl.Float32),
+        pl.col("pitcher_k_rate").fill_null(LEAGUE_AVG["k_rate"]).cast(pl.Float32),
+        pl.col("pitcher_bb_rate").fill_null(LEAGUE_AVG["bb_rate"]).cast(pl.Float32),
         pl.col("pitcher_hr_rate").fill_null(0.033).cast(pl.Float32),
     ])
 
-    # ── 7. Era features + categorical encoding ──────────────────────────────
-    print("\n=== Step 6: Era features + categorical encoding ===")
+    # ── 7. Era + park features + categorical encoding ───────────────────────
+    print("\n=== Step 6: Era + park features + categorical encoding ===")
     silver = add_era_features(silver)
+    silver = add_park_features(silver)
     silver = encode_categoricals(silver)
 
     # ── 8. Select final columns ─────────────────────────────────────────────
@@ -773,9 +575,12 @@ def build(output_path: Path) -> None:
     stab_cols = [c for c in silver.columns if
                  "_stabilized" in c or "_shrinkage_b" in c]
 
+    platoon_extra = [c for c in ("pa_vs_hand",) if c in silver.columns]
+    park_cols = ["park_factor_hr", "park_factor_xb", "is_home"]
     fip_cols  = ["pitcher_fip", "pitcher_k_rate", "pitcher_bb_rate", "pitcher_hr_rate"]
 
-    final_cols = id_cols + label_col + raw_cols + rolling_cols + stab_cols + era_cols + fip_cols
+    final_cols = (id_cols + label_col + raw_cols + rolling_cols + stab_cols
+                  + platoon_extra + park_cols + era_cols + fip_cols)
 
     # Keep only columns that actually exist in the DataFrame
     final_cols = [c for c in final_cols if c in silver.columns]

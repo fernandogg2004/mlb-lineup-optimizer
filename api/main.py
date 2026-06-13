@@ -2313,6 +2313,7 @@ async def explain_batter(
     import requests as _req
     from predict_tonight import (
         _fetch_pitcher_hand,
+        _get_park_factors,
         compute_features,
     )
 
@@ -2359,10 +2360,14 @@ async def explain_batter(
         except Exception:
             pass
 
-    # 3. Build feature vector
+    # 3. Build feature vector (con contexto de juego: park factors + home/away)
     try:
+        pf_hr, pf_xb = _get_park_factors(game)
         X = compute_features(batter_id, opp_throws, silver, feature_names,
-                             pitcher_id=opp_pid)
+                             pitcher_id=opp_pid,
+                             game_date=game.get("officialDate"),
+                             park_factor_hr=pf_hr, park_factor_xb=pf_xb,
+                             is_home=1.0 if team == "home" else 0.0)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Feature computation error: {exc}")
 

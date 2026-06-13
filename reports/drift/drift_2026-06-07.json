@@ -1,0 +1,41 @@
+{
+  "run_date": "2026-06-07",
+  "reference_seasons": [
+    2024,
+    2025
+  ],
+  "recent_days": 30,
+  "recent_cutoff": "2026-05-08",
+  "summary": {
+    "n_ok": 3,
+    "n_warning": 0,
+    "n_critical": 0
+  },
+  "recommendation": "OK: Todas las features estables (PSI < 0.10, n=3).",
+  "features": [
+    {
+      "feature": "launch_speed",
+      "psi": 0.00264,
+      "status": "ok",
+      "ref_mean": 88.56693,
+      "recent_mean": 88.07907,
+      "delta_mean": 0.48786
+    },
+    {
+      "feature": "xwoba",
+      "psi": 0.00242,
+      "status": "ok",
+      "ref_mean": 0.31602,
+      "recent_mean": 0.31359,
+      "delta_mean": 0.00243
+    },
+    {
+      "feature": "launch_angle",
+      "psi": 0.00119,
+      "status": "ok",
+      "ref_mean": 13.06527,
+      "recent_mean": 13.76857,
+      "delta_mean": 0.7033
+    }
+  ]
+}

@@ -32,6 +32,12 @@ reports/*.pdf
 .coverage
 htmlcov/
 
+# Frontend (Node) — NO versionar dependencias ni build
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+node_modules/
+
 # IDE
 .vscode/
 .idea/

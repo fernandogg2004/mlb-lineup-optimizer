@@ -727,6 +727,7 @@ export default function PostGame() {
             <DivergenceTable
               divergences={report.divergences}
               results={resultMap}
+              isDemo={report._source === 'demo'}
             />
           ) : report?.proposed_lineup?.length ? (
             // Fallback: no pre-computed divergences, render read-only table

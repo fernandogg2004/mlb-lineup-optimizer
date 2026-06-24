@@ -181,6 +181,12 @@ export interface PostGameReport {
   team_name?: string;
   /** Display name of the opposing team. */
   opponent_name?: string;
+  /**
+   * Origen de los datos (audit F06): 'live' = API real; 'demo' = fixtures de
+   * demostración (incluye factores/SHAP ilustrativos, NO explicaciones reales
+   * del modelo). La UI debe mostrar un aviso visible cuando es 'demo'.
+   */
+  _source?: 'live' | 'demo';
 }
 
 /** Rolling model metrics over the season (Bug 5 — replaces per-game log-loss). */

@@ -12,6 +12,12 @@ interface DivergenceTableProps {
   divergences: DivergenceRow[];
   /** Actual-game results keyed by slot (optional, shown in Manager column). */
   results?: Record<number, string>;
+  /**
+   * audit F06: cuando los datos provienen del modo demo, los factores son
+   * ILUSTRATIVOS (no SHAP real del modelo). Muestra un aviso visible para que
+   * el usuario no los confunda con explicaciones reales.
+   */
+  isDemo?: boolean;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,7 +53,7 @@ function deltaArrow(delta: number, match: boolean, significant?: boolean): strin
 
 // ── Factor tooltip (Bug 4 — feature importance) ───────────────────────────────
 
-function FactorPanel({ factors }: { factors: FeatureFactor[] }) {
+function FactorPanel({ factors, isDemo }: { factors: FeatureFactor[]; isDemo?: boolean }) {
   if (!factors.length) return null;
 
   return (
@@ -73,6 +79,21 @@ function FactorPanel({ factors }: { factors: FeatureFactor[] }) {
           >
             Factores que explican esta decisión
           </p>
+          {isDemo && (
+            <p
+              style={{
+                fontSize: '0.66rem',
+                color: '#FCD34D',
+                background: 'rgba(245,158,11,0.10)',
+                border: '1px solid rgba(245,158,11,0.35)',
+                borderRadius: 5,
+                padding: '4px 8px',
+                marginBottom: 8,
+              }}
+            >
+              ⚠ Datos de demostración — factores ilustrativos, NO SHAP real del modelo.
+            </p>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {factors.map((f, i) => {
               const fc =
@@ -130,6 +151,7 @@ function FactorPanel({ factors }: { factors: FeatureFactor[] }) {
 export default function DivergenceTable({
   divergences,
   results = {},
+  isDemo = false,
 }: DivergenceTableProps) {
   const [expandedSlot, setExpandedSlot] = useState<number | null>(null);
   // Roadmap 1.3: show significant-only by default to reduce noise
@@ -407,7 +429,7 @@ export default function DivergenceTable({
                   </tr>
 
                   {/* Expandable factor panel (Bug 4) */}
-                  {isExpanded && <FactorPanel factors={row.top_factors} />}
+                  {isExpanded && <FactorPanel factors={row.top_factors} isDemo={isDemo} />}
                 </>
               );
             })}

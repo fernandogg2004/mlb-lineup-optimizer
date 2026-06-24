@@ -76,7 +76,8 @@ export async function fetchPostGameReport(
   if (date) qs.set('date', date);
   qs.set('team', team);
   try {
-    return await request<PostGameReport>(`${BASE}/v1/report/${game_pk}?${qs}`);
+    const live = await request<PostGameReport>(`${BASE}/v1/report/${game_pk}?${qs}`);
+    return { ...live, _source: 'live' };   // dato real de la API (audit F06)
   } catch (e) {
     // Re-throw HTTP errors (404, 503) so the UI shows the actual problem.
     // Only fall back to demo data for network failures (API server not running).
@@ -192,7 +193,8 @@ async function fetchDemoReport(
         (r: PostGameReport) => r.game_pk === game_pk
       );
       if (fixture) {
-        return team === 'away' ? _flipReportToAway(fixture) : fixture;
+        const demo = { ...fixture, _source: 'demo' as const };
+        return team === 'away' ? _flipReportToAway(demo) : demo;
       }
     }
   } catch {
@@ -249,6 +251,7 @@ const DEMO_ROLLING_METRICS: RollingMetrics = {
 };
 
 const DEMO_REPORT: PostGameReport = {
+  _source: 'demo',   // factores/SHAP de abajo son ILUSTRATIVOS, no del modelo (audit F06)
   game_pk: DEMO_GAME_PK,
   game_date: '2026-05-20',
   matchup: 'NYY 5  ·  TOR 3',

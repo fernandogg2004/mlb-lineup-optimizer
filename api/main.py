@@ -3,6 +3,15 @@ api/main.py
 ===========
 FastAPI — Serving de inferencia para el modelo MLB AtBatPredictor.
 
+⚠️ ROL (audit F10): ESTE es el backend de PRODUCCIÓN que sirve al frontend React
+(WarRoom/PostGame/TrackRecord). Usa predict_tonight._predict_one_side y, desde la
+auditoría 2026-06, soporta optimización real del orden vía ?optimize=true (GA).
+El otro backend, ``app/main.py``, es un microservicio SEPARADO orientado a la
+optimización GA asíncrona (/v1/optimize/lineup) y NO es el que consume el SPA.
+Ambos comparten la fuente única de constantes en ``src/constants.py`` para evitar
+drift (antes app/main.py tenía constantes de 7 clases hardcodeadas). La fusión
+física de ambos servicios es un refactor de despliegue a abordar por separado.
+
 Endpoints:
   POST /v1/predict/game/{game_pk}   → predicción de un partido
   POST /v1/predict/all              → todos los partidos de una fecha
@@ -811,12 +820,16 @@ async def get_optimize(
     request: Request,
     team: str = "home",
     n_sims: int = 10_000,
+    optimize: bool = False,
     _: None = Depends(_optional_token),
 ) -> dict:
     """
     Lineup óptimo calculado en tiempo real — sin PostgreSQL.
     Usa el modelo y Silver ya cargados en memoria al arrancar uvicorn.
     Limitado a 10 peticiones/min por IP.
+
+    optimize (audit F01): si es True, busca el orden con el GeneticOptimizer
+    (más lento, 3-30s) en vez de solo la heurística SabermetricSeeder.
     """
     _rate_limit(request, max_calls=10, window_secs=60)
 
@@ -852,6 +865,7 @@ async def get_optimize(
             game, team, _state["silver"], _state["predictor"],
             game_date, verbose=False,
             feature_names=_state.get("feature_names"),
+            optimize=optimize,   # audit F01: GA real opcional
         )
         log.info("optimize: prediccion completada, er=%.2f", result.get("expected_runs_per_game", 0) if result else 0)
     except Exception as exc:
@@ -1028,6 +1042,10 @@ async def get_optimize(
         "model_confidence":         _conf_pct / 100.0,
         "model_confidence_detail":  _conf_detail,
         "optimization_mode":        optimization_mode,
+        # audit F01: fuente real del ORDEN de bateo (heurística vs GA) y si el
+        # orden ganador supera al runner-up más allá del ruido de muestreo MC.
+        "order_source":             result.get("optimization_mode", "SabermetricSeeder"),
+        "order_significant_vs_second": result.get("order_significant_vs_second"),
         "model_version":            _state.get("model_version", "v2.1.0"),
         "total_simulations":        total_simulations,
         "elapsed_seconds":          round(elapsed_mc, 4),

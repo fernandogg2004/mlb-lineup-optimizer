@@ -1,6 +1,13 @@
 """
 MLB Lineup Optimizer — FastAPI Inference Service.
 
+⚠️ ROL (audit F10): microservicio SEPARADO orientado a la optimización GA
+asíncrona y a la predicción PA individual. NO es el backend que sirve al SPA
+React — ese es ``api/main.py`` (producción). Comparte la fuente única de
+constantes ``src/constants.py`` (antes este módulo tenía constantes de 7 clases
+hardcodeadas, corregidas en la auditoría 2026-06). La consolidación física con
+api/main.py es un refactor de despliegue a tratar por separado.
+
 Endpoints:
     POST /v1/predict/at-bat    — single PA outcome prediction, P99 < 50ms
     POST /v1/optimize/lineup   — full GA lineup optimization (async, 3–30s)
@@ -127,18 +134,18 @@ _AB_OUTCOMES = Counter(
 # App state — loaded once at startup, shared across all requests
 # ---------------------------------------------------------------------------
 
-_OUTCOME_NAMES = [
-    "OUT_IN_PLAY", "STRIKEOUT", "WALK_HBP", "SINGLE", "DOUBLE", "TRIPLE", "HOME_RUN"
-]
-_RUN_VALUES = np.array([0.00, 0.00, 0.33, 0.47, 0.77, 1.04, 1.40], dtype=np.float32)
-
-# League-average 9×7 prob matrix used when opp_lineup_probs is not supplied
-_LEAGUE_AVG_PA_PROBS = np.array(
-    [[0.28, 0.22, 0.08, 0.15, 0.05, 0.01, 0.03]] * 9,
-    dtype=np.float32,
+# Constantes de outcome — fuente única de verdad (src/constants.py), 8 clases
+# desde Mejora 6. Antes estaban hardcodeadas a 7 clases aquí, lo que rompía el
+# endpoint /predict (np.dot 8 vs 7) y el opp por defecto del optimizador (audit F02).
+from src.constants import (  # noqa: E402
+    RUN_VALUES as _RUN_VALUES,
+    LEAGUE_AVG_LINEUP as _LEAGUE_AVG_PA_PROBS,  # matriz 9×8 normalizada
 )
-# Renormalize to sum-to-1
-_LEAGUE_AVG_PA_PROBS /= _LEAGUE_AVG_PA_PROBS.sum(axis=1, keepdims=True)
+
+_OUTCOME_NAMES = [
+    "OUT_IN_PLAY", "STRIKEOUT", "WALK_HBP", "SINGLE",
+    "DOUBLE", "TRIPLE", "HOME_RUN", "DOUBLE_PLAY",
+]
 
 
 _LINEUP_CACHE_TTL_SECONDS: float = 86_400  # 24 hours

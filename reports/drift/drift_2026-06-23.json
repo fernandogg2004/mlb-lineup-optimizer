@@ -1,0 +1,65 @@
+{
+  "run_date": "2026-06-23",
+  "reference_seasons": [
+    2024,
+    2025
+  ],
+  "recent_days": 30,
+  "recent_cutoff": "2026-05-24",
+  "summary": {
+    "n_ok": 5,
+    "n_warning": 0,
+    "n_critical": 1
+  },
+  "recommendation": "ACCION REQUERIDA: 1 features con drift critico (PSI >= 0.25): ['game_pk']. Ejecutar retrain del modelo.",
+  "features": [
+    {
+      "feature": "game_pk",
+      "psi": 18.42068,
+      "status": "critical",
+      "ref_mean": 762608.23621,
+      "recent_mean": 823916.20957,
+      "delta_mean": 61307.97335
+    },
+    {
+      "feature": "launch_speed",
+      "psi": 0.00214,
+      "status": "ok",
+      "ref_mean": 88.58255,
+      "recent_mean": 88.13529,
+      "delta_mean": 0.44725
+    },
+    {
+      "feature": "at_bat_number",
+      "psi": 0.00125,
+      "status": "ok",
+      "ref_mean": 38.58833,
+      "recent_mean": 39.12742,
+      "delta_mean": 0.53909
+    },
+    {
+      "feature": "xwoba",
+      "psi": 0.00098,
+      "status": "ok",
+      "ref_mean": 0.31606,
+      "recent_mean": 0.32273,
+      "delta_mean": 0.00666
+    },
+    {
+      "feature": "launch_angle",
+      "psi": 0.00076,
+      "status": "ok",
+      "ref_mean": 13.04476,
+      "recent_mean": 13.57232,
+      "delta_mean": 0.52756
+    },
+    {
+      "feature": "pitch_count_in_pa",
+      "psi": 0.0004,
+      "status": "ok",
+      "ref_mean": 3.89263,
+      "recent_mean": 3.87556,
+      "delta_mean": 0.01707
+    }
+  ]
+}

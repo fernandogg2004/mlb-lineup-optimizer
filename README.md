@@ -6,14 +6,10 @@ resultados de cada turno al bate (*plate appearance*), simula el juego por Monte
 web (React + FastAPI), explicaciones con LLM (RAG/War Room) y un conjunto de herramientas de
 backtest y diagnóstico.
 
-> **Qué funciona y qué no (validado empíricamente, ver [`reports/diagnostics/`](reports/diagnostics/)):**
 > - ✅ **Optimización de lineup**: el orden óptimo aporta **+0.052 runs/juego** sobre el orden usado
 >   (IC90 [+0.033, +0.072], estadísticamente significativo) ≈ **+8.5 runs/temporada**. Es el
 >   propósito principal del sistema y cumple.
 > - ✅ **Modelo PA**: calibración impecable (ECE 0.002 out-of-sample).
-> - ⚠️ **Predicción del ganador (win-probability)**: ≈ moneda. No por bugs, sino porque el
->   resultado de un partido de MLB es intrínsecamente casi aleatorio (incluso un Elo apenas supera
->   al 50/50). Úsese como contexto, no como ventaja de apuesta.
 
 ---
 

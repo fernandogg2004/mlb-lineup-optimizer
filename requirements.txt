@@ -1,6 +1,18 @@
 # =============================================================================
-# MLB Lineup Optimizer — Phase 1 Dependencies
+# MLB Lineup Optimizer — Phase 1 (DATA-ENGINEERING) Dependencies
 # Python 3.11+  |  Last verified: 2026-05-18
+#
+# ⚠️ ¿QUÉ FICHERO INSTALAR? Este NO arranca el producto por sí solo: solo trae
+#    la infra de datos (Spark, Delta, Airflow, dbt, Great Expectations). El
+#    modelo, el simulador, el optimizador y la API viven en otros ficheros:
+#      • Uso local (predict_tonight / train_v3 / backtest / SPA backend):
+#            pip install -r requirements_local.txt     (Python 3.11–3.12)
+#      • Despliegue del servicio de inferencia (FastAPI):
+#            pip install -r requirements_api.txt
+#      • Pipeline batch de ingestión/ETL (este fichero):
+#            pip install -r requirements.txt
+#    lightgbm / numba / deap / ray / mlflow / scikit-learn están en api/local,
+#    NO aquí.
 #
 # Spark / Delta compatibility matrix:
 #   PySpark 3.5.x  ↔  delta-spark 3.1.x  ↔  Java 11 or 17

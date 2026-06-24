@@ -55,9 +55,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-import ray
 import structlog
 from numba import njit, prange
+
+# Ray se importa de forma PEREZOSA dentro de MonteCarloEngine (audit F16): es una
+# dependencia pesada y, con use_probabilistic_advances=True (default), la rama Ray
+# ni siquiera se ejecuta. Importarla al cargar el módulo encarecía cada arranque
+# (predict_tonight, api) que corre con use_ray=False.
 
 from src.simulation.runner_advance_tables import (
     RunnerAdvanceConfig,
@@ -320,9 +324,12 @@ def _simulate_half_inning_prob(
 
         if outcome <= 1:              # OUT_IN_PLAY or STRIKEOUT → 1 out
             outs += 1
-        elif outcome == 7:            # DOUBLE_PLAY → 2 outs (Mejora 6)
-            outs += 2
-            bases = new_bases_tbl_p[7, bases, 0]   # DP scenario is always slot 0
+        elif outcome == 7:            # DOUBLE_PLAY (Mejora 6 / audit D1)
+            if bases & 1:             # corredor en 1B → GIDP real: 2 outs, elimina 1B
+                outs += 2
+                bases = new_bases_tbl_p[7, bases, 0]   # DP scenario is always slot 0
+            else:                     # sin corredor forzable en 1B → out sencillo
+                outs += 1
         else:
             scenario = _sample_scenario(scenario_probs_tbl[outcome, bases])
             total_runs += runs_tbl_p[outcome, bases, scenario]
@@ -453,6 +460,53 @@ def _simulate_n_games_prob(
     return my_runs, opp_runs, went_extra
 
 
+@njit(parallel=True, cache=True)
+def _simulate_n_runs_only(
+    my_probs: np.ndarray,
+    new_bases_tbl_p: np.ndarray,
+    runs_tbl_p: np.ndarray,
+    scenario_probs_tbl: np.ndarray,
+    park_factor_hr: float,
+    park_factor_xb: float,
+    n_sims: int,
+    n_innings: int,
+) -> np.ndarray:
+    """Simula SOLO la ofensiva de mi equipo y devuelve las carreras por juego.
+
+    Optimización de cómputo (audit B4): la fitness del GA solo necesita E[R]
+    de mi lineup. ``_simulate_n_games_prob`` simulaba además la ofensiva rival
+    para producir ``opp_runs``, que ``run_fast`` descartaba — como no hay
+    interacción defensa↔ataque (las carreras dependen solo de los prob_vectors
+    del equipo que batea), esa mitad del trabajo era puro desperdicio. Este
+    kernel reproduce EXACTAMENTE la misma distribución de ``my_runs`` que la
+    rama de mi equipo en ``_simulate_game_prob`` (pos inicia en 0, cada entrada
+    arranca con bases vacías, sin extra innings), a ~mitad de coste.
+
+    Args:
+        my_probs: Matriz de probabilidad de mi lineup, shape (9, N_OUTCOMES). float32.
+        new_bases_tbl_p / runs_tbl_p / scenario_probs_tbl: Tablas probabilísticas.
+        park_factor_hr / park_factor_xb: Multiplicadores de park factor.
+        n_sims: Número de juegos a simular.
+        n_innings: Entradas de regulación.
+
+    Returns:
+        Array ``my_runs`` de longitud n_sims (int32).
+    """
+    my_runs = np.empty(n_sims, dtype=np.int32)
+    for i in prange(n_sims):
+        runs = 0
+        pos = 0
+        for _ in range(n_innings):
+            r, pos = _simulate_half_inning_prob(
+                my_probs, pos,
+                new_bases_tbl_p, runs_tbl_p, scenario_probs_tbl,
+                park_factor_hr, park_factor_xb, 0,
+            )
+            runs += r
+        my_runs[i] = runs
+    return my_runs
+
+
 @njit(cache=True)
 def _simulate_half_inning(
     lineup_probs: np.ndarray,
@@ -492,9 +546,12 @@ def _simulate_half_inning(
 
         if outcome <= 1:        # OUT_IN_PLAY or STRIKEOUT → 1 out
             outs += 1
-        elif outcome == 7:      # DOUBLE_PLAY → 2 outs, runner on 1B removed (Mejora 6)
-            outs += 2
-            bases = new_bases_tbl[7, bases]   # clears bit-0 (runner on 1B)
+        elif outcome == 7:      # DOUBLE_PLAY (Mejora 6 / audit D1)
+            if bases & 1:       # corredor en 1B → GIDP real: 2 outs, elimina 1B
+                outs += 2
+                bases = new_bases_tbl[7, bases]   # clears bit-0 (runner on 1B)
+            else:               # sin corredor forzable en 1B → out sencillo
+                outs += 1
         else:
             total_runs += runs_tbl[outcome, bases]
             bases = new_bases_tbl[outcome, bases]
@@ -782,6 +839,16 @@ def warmup_jit() -> None:
     )
     log.info("jit_warmup_prob_done", elapsed_s=round(time.perf_counter() - t0, 2))
 
+    # Runs-only path (audit B4): proxy de fitness del GA (solo mi ofensiva)
+    _simulate_n_runs_only(
+        dummy_probs,
+        _NEW_BASES_TBL_P, _RUNS_TBL_P, _SCENARIO_PROBS,
+        1.0, 1.0,
+        n_sims=100,
+        n_innings=9,
+    )
+    log.info("jit_warmup_runs_only_done", elapsed_s=round(time.perf_counter() - t0, 2))
+
     # Staff-aware path (Mejora 1): per-inning opp probs matrix
     dummy_per_inning = np.tile(dummy_probs, (9, 1, 1))  # (9, 9, N_OUTCOMES)
     _simulate_n_games_with_staff(
@@ -839,7 +906,10 @@ class SimulationResult:
     close_game_win_pct: float
     shutout_pct: float
     elapsed_seconds: float
-    # ── Prediction interval fields (audit fix: IC90 must be 15-25pp wide) ──────
+    # ── Prediction interval fields ────────────────────────────────────────────
+    # win_prob_ci_* = IC90 del ERROR DE MUESTREO Monte Carlo (binomial real,
+    # audit F04). Es estrecho con n grande, a propósito; NO es la incertidumbre
+    # epistémica del modelo (esa sale del backtest out-of-sample).
     win_prob_ci_low: float = 0.0
     win_prob_ci_high: float = 1.0
     std_dev_runs_scored: float = 2.5
@@ -917,32 +987,27 @@ def _aggregate_results(
 
     pct_keys = [5, 25, 50, 75, 95]
 
-    # ── IC90 for win probability (audit requirement: 15-25pp width) ──────────
-    # We use Wilson score interval scaled to a 100-game validation sample.
-    # This represents epistemic uncertainty: "if we validated on 100 games,
-    # how wide would our confidence interval be?"  With n=10k MC sims the
-    # sampling error is <1pp, which looks broken to reviewers — but a 100-game
-    # validation sample correctly shows ±7-12pp (the real model uncertainty).
-    _z90 = 1.645          # z-score for 90% CI
-    _n_eff = 100          # representative validation sample size (one season subset)
+    # ── IC90 del MUESTREO Monte Carlo para win probability (audit F04) ───────
+    # HONESTO: error binomial de la estimación MC, SE = sqrt(p(1-p)/n). Antes se
+    # fabricaba con un _n_eff=100 inventado para ensanchar el intervalo "porque
+    # <1pp looks broken to reviewers". Eso presentaba incertidumbre ficticia
+    # como si fuera del modelo. Aquí se reporta el error de muestreo REAL: con n
+    # grande el IC es estrecho a propósito (solo dice cuánta incertidumbre de
+    # muestreo MC queda). La incertidumbre EPISTÉMICA del modelo (más ancha) debe
+    # estimarse del backtest out-of-sample, no inventarse en el agregador.
+    _z90 = 1.645          # z-score para IC del 90%
     _p = win_probability
-    _denom = 1.0 + _z90 ** 2 / _n_eff
-    _ci_center = (_p + _z90 ** 2 / (2 * _n_eff)) / _denom
-    _ci_half = (_z90 / _denom) * float(np.sqrt(
-        _p * (1 - _p) / _n_eff + _z90 ** 2 / (4 * _n_eff ** 2)
-    ))
-    win_prob_ci_low  = float(np.clip(_ci_center - _ci_half, 0.0, 1.0))
-    win_prob_ci_high = float(np.clip(_ci_center + _ci_half, 0.0, 1.0))
+    _se = float(np.sqrt(max(_p * (1.0 - _p), 0.0) / max(n, 1)))
+    win_prob_ci_low  = float(np.clip(_p - _z90 * _se, 0.0, 1.0))
+    win_prob_ci_high = float(np.clip(_p + _z90 * _se, 0.0, 1.0))
 
     # ── Standard deviation + percentiles for runs distribution ──────────────
+    # Valores REALES de la distribución simulada (sin pisos cosméticos). Un P10=0
+    # es un juego de blanqueada legítimo, no un fallo; el formateo es tarea de la
+    # capa de presentación, no del cálculo (audit F04).
     std_dev_runs = float(np.std(my_runs))
     p10 = float(np.percentile(my_runs, 10))
     p90 = float(np.percentile(my_runs, 90))
-
-    # Baseball floor: P10 represents a shutout-adjacent game (1 run minimum
-    # in display) per auditor spec — zero-run games are valid but misleading
-    # as "P10 = 0.0" signals distribution failure to non-technical reviewers.
-    p10_display = float(max(1.0, p10))
 
     # ── Uncertainty level from P10–P90 interval width ───────────────────────
     interval_width = p90 - p10
@@ -979,7 +1044,7 @@ def _aggregate_results(
         win_prob_ci_high=win_prob_ci_high,
         std_dev_runs_scored=std_dev_runs,
         uncertainty_level=uncertainty_level,
-        percentile_10=p10_display,
+        percentile_10=p10,
         percentile_90=p90,
         extra_innings_rate=extra_innings_rate,
     )
@@ -989,7 +1054,6 @@ def _aggregate_results(
 # Ray remote worker
 # ---------------------------------------------------------------------------
 
-@ray.remote
 def _simulate_batch_remote(
     my_probs: np.ndarray,
     opp_probs: np.ndarray,
@@ -999,6 +1063,10 @@ def _simulate_batch_remote(
     n_innings: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Ray remote task: simulates a batch of games on one worker.
+
+    Plain function (audit F16): se envuelve con ``ray.remote`` en tiempo de
+    ejecución dentro de ``MonteCarloEngine._ensure_ray`` para no requerir Ray al
+    importar el módulo.
 
     Each worker runs its own Numba-parallel batch, giving two levels of
     parallelism: intra-worker (Numba prange threads) and inter-worker (Ray).
@@ -1102,6 +1170,7 @@ class MonteCarloEngine:
         """
         self.config = config or MonteCarloConfig()
         self._ray_initialized = False
+        self._ray_remote_fn = None   # envoltura ray.remote perezosa (audit F16)
 
         # Build probabilistic tables for the configured era
         if self.config.runner_advance_era == _DEFAULT_PROB_ERA:
@@ -1123,12 +1192,20 @@ class MonteCarloEngine:
             extra_innings=self.config.use_extra_innings,
         )
 
-    def _ensure_ray(self) -> None:
-        """Initializes the Ray runtime if it is not already running."""
+    def _ensure_ray(self):
+        """Imports Ray lazily, inits the runtime, and returns the remote fn.
+
+        Audit F16: Ray solo se importa aquí (no al cargar el módulo). Devuelve la
+        función ``_simulate_batch_remote`` ya envuelta con ``ray.remote``.
+        """
+        import ray  # import perezoso
         if not self._ray_initialized and not ray.is_initialized():
             ray.init(ignore_reinit_error=True)
             self._ray_initialized = True
             log.info("ray_initialized")
+        if self._ray_remote_fn is None:
+            self._ray_remote_fn = ray.remote(_simulate_batch_remote)
+        return ray, self._ray_remote_fn
 
     def run(
         self,
@@ -1221,12 +1298,12 @@ class MonteCarloEngine:
             )
         else:
             # Deterministic Ray + Numba: legacy full mode
-            self._ensure_ray()
+            ray, remote_fn = self._ensure_ray()
             sims_per_worker = n_sims // self.config.n_ray_workers
             remainder       = n_sims % self.config.n_ray_workers
 
             futures = [
-                _simulate_batch_remote.remote(
+                remote_fn.remote(
                     my_probs, opp_probs, pf_hr, pf_xb,
                     sims_per_worker + (1 if i < remainder else 0),
                     self.config.n_innings,
@@ -1256,8 +1333,8 @@ class MonteCarloEngine:
         self,
         my_lineup_probs: np.ndarray,
         opp_lineup_probs: np.ndarray,
-        park_factor_hr: float = 1.0,
-        park_factor_xb: float = 1.0,
+        park_factor_hr: Optional[float] = None,
+        park_factor_xb: Optional[float] = None,
     ) -> float:
         """Returns only E[R] using the fast (Numba-only) simulation mode.
 
@@ -1265,21 +1342,34 @@ class MonteCarloEngine:
         ``lineup_optimizer.py``. It returns a scalar float for maximum
         speed, skipping all aggregation overhead except the mean.
 
+        Consistencia fitness/refinamiento (audit fix F03):
+            Usa exactamente las MISMAS tablas probabilísticas de 8 outcomes
+            (``_nb_tbl_p`` / ``_runs_tbl_p`` / ``_scen_probs``) y los MISMOS park
+            factors que ``run(fast_mode=False)``. La única diferencia es el número
+            de simulaciones (``fast_mode_n_sims``) y la ausencia de extra innings
+            (irrelevantes para E[R] y costosos en el bucle del GA). Así el GA busca
+            sobre el mismo paisaje de fitness que el refinamiento, en vez del
+            proxy determinista de máximo avance que inflaba E[R] 0.2–0.4 carreras.
+
         Args:
-            my_lineup_probs: My team's probability matrix, shape (9, 7).
-            opp_lineup_probs: Opponent's probability matrix, shape (9, 7).
-            park_factor_hr: HR park factor.
-            park_factor_xb: Extra-base hit park factor.
+            my_lineup_probs: My team's probability matrix, shape (9, N_OUTCOMES).
+            opp_lineup_probs: Opponent's probability matrix, shape (9, N_OUTCOMES).
+            park_factor_hr: HR park factor. Si ``None``, usa ``config.park_factor_hr``.
+            park_factor_xb: Extra-base hit park factor. Si ``None``, usa el de config.
 
         Returns:
             ``E[R]`` as a scalar float.
         """
-        my_probs  = my_lineup_probs.astype(np.float32)
-        opp_probs = opp_lineup_probs.astype(np.float32)
-        my_runs, _ = _simulate_n_games(
-            my_probs, opp_probs,
-            _NEW_BASES_TBL, _RUNS_TBL,
-            park_factor_hr, park_factor_xb,
+        pf_hr = park_factor_hr if park_factor_hr is not None else self.config.park_factor_hr
+        pf_xb = park_factor_xb if park_factor_xb is not None else self.config.park_factor_xb
+        my_probs = my_lineup_probs.astype(np.float32)
+        # ``opp_lineup_probs`` se ignora a propósito (audit B4): E[R] de mi lineup
+        # no depende de la ofensiva rival. Se mantiene en la firma por
+        # compatibilidad con quien llama (el GA pasa el oponente de liga).
+        my_runs = _simulate_n_runs_only(
+            my_probs,
+            self._nb_tbl_p, self._runs_tbl_p, self._scen_probs,
+            pf_hr, pf_xb,
             self.config.fast_mode_n_sims, self.config.n_innings,
         )
         return float(my_runs.mean())
@@ -1367,8 +1457,14 @@ def compute_run_expectancy_matrix(
 
                 while outs < 3:
                     outcome = _sample_outcome(probs[pos])
-                    if outcome <= 1:
+                    if outcome <= 1:            # OUT_IN_PLAY o STRIKEOUT → 1 out
                         outs += 1
+                    elif outcome == 7:          # DOUBLE_PLAY (audit F11 / D1)
+                        if bases & 1:           # corredor en 1B → GIDP real: 2 outs
+                            outs  += 2
+                            bases  = _NEW_BASES_TBL[7, bases]
+                        else:                   # sin corredor forzable → out sencillo
+                            outs += 1
                     else:
                         runs  += _RUNS_TBL[outcome, bases]
                         bases  = _NEW_BASES_TBL[outcome, bases]

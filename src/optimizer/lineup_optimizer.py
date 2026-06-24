@@ -64,6 +64,8 @@ import numpy as np
 import structlog
 from deap import base, creator, tools
 
+from src.constants import N_OUTCOMES
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -95,8 +97,9 @@ class PlayerStats:
         iso: Isolated Power = SLG − AVG.
         batter_stand: Batting hand (``"L"``, ``"R"``, or ``"S"``).
         prob_vector: Pre-computed calibrated probability vector vs. today's
-            starting pitcher, shape (7,). If ``None``, must be provided later
-            via the full feature matrix.
+            starting pitcher, shape (8,) — 8 PA outcome classes incl. DOUBLE_PLAY
+            (Mejora 6). If ``None``, must be provided later via the full feature
+            matrix.
     """
 
     player_id: int
@@ -147,7 +150,15 @@ class GAConfig:
     seed: int = 42
     mlflow_experiment: str = "lineup-optimizer"
     n_sabermetric_seeds: int = 50
-    bullpen_weight: float = 0.40   # fracción del partido cubierta por bullpen (innings 6-9 ≈ 40%)
+    # Objetivo del refinamiento final (audit A2). El GA busca siempre sobre E[R]
+    # (proxy barato y muy correlacionado), pero el ganador entre los top-K puede
+    # elegirse por:
+    #   "expected_runs"    → máximo E[R] (comportamiento histórico; por defecto)
+    #   "win_probability"  → máxima P(Victoria) contra el oponente fijo, que es el
+    #                        objetivo REAL del producto. Para oponente constante
+    #                        ambos correlacionan, pero no son idénticos (la
+    #                        varianza del lineup importa).
+    objective: str = "expected_runs"
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +394,9 @@ class OptimizerResult:
     refinement_scores: list[float]
     total_elapsed_seconds: float
     n_fitness_evaluations: int
+    # ── Significancia estadística del orden ganador (audit F18) ───────────────
+    best_expected_runs_se: float = 0.0      # error estándar de muestreo del E[R]
+    is_significant_vs_second: bool = True   # ¿el #1 supera al #2 más allá del ruido?
 
     def display(self) -> str:
         """Returns a formatted lineup display string for the coaching staff UI."""
@@ -407,11 +421,20 @@ class GeneticLineupOptimizer:
     """Finds the E[R]-maximizing batting order using a 3-layer search strategy.
 
     The optimizer is stateless between runs: each call to ``run()`` is fully
-    independent and reproducible given the same ``config.seed``.
+    independent.
+
+    Reproducibilidad (audit F15): ``config.seed`` siembra los operadores del GA
+    (población inicial, crossover, mutación, selección), de modo que la
+    TRAYECTORIA de búsqueda es reproducible. Sin embargo, la fitness Monte Carlo
+    corre sobre ``numba.prange`` con un estado RNG por hilo no sembrado, así que
+    los valores ABSOLUTOS de E[R] tienen un pequeño ruido de muestreo (~1/√n_sims)
+    que varía entre ejecuciones y número de hilos. El ranking de alineaciones es
+    estable; los E[R] reportados deben interpretarse con su error de muestreo (ver
+    ``SimulationResult.win_prob_ci_*`` y el IC de E[R]), no como cifras exactas.
 
     Args:
         players: List of exactly 9 ``PlayerStats`` for today's active roster.
-        lineup_probs: Pre-computed probability matrix, shape (9, 7).
+        lineup_probs: Pre-computed probability matrix, shape (9, 8).
             Row i corresponds to ``players[i]``. Each row must sum to 1.0.
         simulation_engine: Configured ``MonteCarloEngine`` instance.
         config: GA hyperparameters and simulation settings.
@@ -424,38 +447,44 @@ class GeneticLineupOptimizer:
         simulation_engine,           # MonteCarloEngine (typed as Any to avoid circular import)
         opp_lineup_probs: np.ndarray,
         config: Optional[GAConfig] = None,
-        opp_bullpen_probs: Optional[np.ndarray] = None,
     ) -> None:
         """Initializes the optimizer.
 
         Args:
             players: Exactly 9 ``PlayerStats`` for the active lineup.
-            lineup_probs: Probability matrix shape (9, 7). Row order matches ``players``.
+            lineup_probs: Probability matrix shape (9, 8). Row order matches ``players``.
             simulation_engine: ``MonteCarloEngine`` instance from simulation_engine.py.
-            opp_lineup_probs: Opponent starter probability matrix, shape (9, 7).
+            opp_lineup_probs: Opponent probability matrix, shape (9, 8). Constante
+                entre órdenes; sirve para ordenar nuestra alineación (y, con
+                ``objective="win_probability"``, para la P(W) del refinamiento).
             config: GA configuration; uses defaults if not provided.
-            opp_bullpen_probs: Optional opponent bullpen probability matrix, shape (9, 7).
-                When provided, fitness = (1-bullpen_weight)*starter_ev + bullpen_weight*bullpen_ev.
-                Falls back to opp_lineup_probs (starter) if None.
+
+        Nota (audit A1): el modelado del bullpen rival en E[R] NO está
+        implementado. La capa de fitness usa un único perfil de pitcher (el
+        abridor, codificado en ``lineup_probs``) para las 9 entradas. El antiguo
+        par ``opp_bullpen_probs``/``bullpen_weight`` era un no-op —
+        ``run_fast`` devuelve las carreras de MI lineup, independientes del
+        oponente— y se ha retirado para no comunicar una capacidad inexistente.
+        Modelar el relevo de verdad (prob_vectors del bateador vs bullpen +
+        simulación por-entrada de mi ofensiva) es un ítem de roadmap (Fase C).
 
         Raises:
             ValueError: If player count != 9 or probability shapes are wrong.
         """
         if len(players) != 9:
             raise ValueError(f"Expected 9 players, got {len(players)}.")
-        if lineup_probs.shape != (9, 7):
-            raise ValueError(f"lineup_probs must be (9, 7), got {lineup_probs.shape}.")
-        if opp_lineup_probs.shape != (9, 7):
-            raise ValueError(f"opp_lineup_probs must be (9, 7), got {opp_lineup_probs.shape}.")
+        if lineup_probs.shape != (9, N_OUTCOMES):
+            raise ValueError(
+                f"lineup_probs must be (9, {N_OUTCOMES}), got {lineup_probs.shape}."
+            )
+        if opp_lineup_probs.shape != (9, N_OUTCOMES):
+            raise ValueError(
+                f"opp_lineup_probs must be (9, {N_OUTCOMES}), got {opp_lineup_probs.shape}."
+            )
 
         self.players          = players
         self.lineup_probs     = lineup_probs.astype(np.float32)
         self.opp_lineup_probs = opp_lineup_probs.astype(np.float32)
-        self.opp_bullpen_probs = (
-            opp_bullpen_probs.astype(np.float32)
-            if opp_bullpen_probs is not None
-            else None
-        )
         self.sim              = simulation_engine
         self.config           = config or GAConfig()
         self._seeder          = SabermetricSeeder(players)
@@ -545,15 +574,7 @@ class GeneticLineupOptimizer:
             Tuple ``(expected_runs,)`` (DEAP requires a tuple return).
         """
         ordered_probs = self.lineup_probs[individual].astype(np.float32)
-        starter_er = self.sim.run_fast(ordered_probs, self.opp_lineup_probs)
-
-        if self.opp_bullpen_probs is not None:
-            bw = self.config.bullpen_weight
-            bullpen_er = self.sim.run_fast(ordered_probs, self.opp_bullpen_probs)
-            er = (1 - bw) * starter_er + bw * bullpen_er
-        else:
-            er = starter_er
-
+        er = self.sim.run_fast(ordered_probs, self.opp_lineup_probs)
         self._n_evals += 1
         return (er,)
 
@@ -708,9 +729,17 @@ class GeneticLineupOptimizer:
         Returns:
             Tuple ``(best_lineup_indices, best_er_from_full_simulation)``.
         """
+        objective = getattr(self.config, "objective", "expected_runs")
+
+        best_metric = -np.inf
         best_er   = -np.inf
+        best_se   = 0.0
         best_idx  = candidates[0]
-        scores: list[float] = []
+        best_win  = 0.5
+        scores: list[float] = []        # E[R] por candidato (= refinement_scores)
+        win_scores: list[float] = []    # P(W) por candidato
+        er_ses: list[float] = []        # SE de muestreo del E[R]
+        metric_ses: list[float] = []    # SE de la métrica OBJETIVO (E[R] o P(W))
 
         for i, cand in enumerate(candidates):
             ordered_probs = self.lineup_probs[cand].astype(np.float32)
@@ -719,28 +748,73 @@ class GeneticLineupOptimizer:
                 self.opp_lineup_probs,
                 fast_mode=False,
             )
-            er = result.expected_runs_scored
+            er  = result.expected_runs_scored
+            win = result.win_probability
+            # Error estándar del E[R] estimado por Monte Carlo (audit F18):
+            # SE = sigma_runs / sqrt(n_sims). Cuantifica el ruido de muestreo.
+            er_se = result.std_dev_runs_scored / max(np.sqrt(result.n_simulations), 1.0)
+            # SE binomial de la win probability (audit A2): sqrt(p(1-p)/n).
+            win_se = float(np.sqrt(max(win * (1.0 - win), 0.0)
+                                   / max(result.n_simulations, 1)))
             scores.append(er)
+            win_scores.append(win)
+            er_ses.append(float(er_se))
+
+            # Métrica que decide el ganador, según el objetivo configurado.
+            metric    = win if objective == "win_probability" else er
+            metric_se = win_se if objective == "win_probability" else float(er_se)
+            metric_ses.append(metric_se)
 
             log.info(
                 "refinement_eval",
                 rank=i + 1,
+                objective=objective,
                 er=round(er, 4),
-                win_prob=round(result.win_probability, 4),
+                er_se=round(float(er_se), 4),
+                win_prob=round(win, 4),
+                win_se=round(win_se, 4),
                 lineup=[self.players[j].player_name for j in cand],
             )
 
-            if er > best_er:
+            if metric > best_metric:
+                best_metric = metric
                 best_er  = er
+                best_se  = float(er_se)
                 best_idx = cand
-                best_win = result.win_probability
+                best_win = win
+
+        # ── Test de significancia del ganador vs el runner-up (audit F18/A2) ───
+        # Sobre la MÉTRICA OBJETIVO: si los dos mejores solapan dentro de su error
+        # de muestreo conjunto, la elección es ruido y se declara explícitamente
+        # en vez de fingir que el orden #1 es estrictamente mejor.
+        primary = win_scores if objective == "win_probability" else scores
+        significant = True
+        delta_vs_second = 0.0
+        if len(primary) >= 2:
+            order = np.argsort(primary)[::-1]
+            i1, i2 = int(order[0]), int(order[1])
+            delta_vs_second = float(primary[i1] - primary[i2])
+            se_joint = float(np.sqrt(metric_ses[i1] ** 2 + metric_ses[i2] ** 2))
+            # Significativo al 90% si |delta| > 1.645 * SE_conjunto
+            significant = delta_vs_second > 1.645 * se_joint
 
         log.info(
             "refinement_complete",
+            objective=objective,
             best_er=round(best_er, 4),
+            best_er_se=round(best_se, 4),
             best_win=round(best_win, 4),
+            delta_vs_second=round(delta_vs_second, 4),
+            significant_at_90=significant,
         )
-        return best_idx, best_er, best_win, scores
+        if not significant:
+            log.warning(
+                "lineup_choice_not_significant",
+                msg=("El mejor orden no supera al runner-up más allá del ruido MC. "
+                     "Considera aumentar refinement_n_sims o tratar ambos como equivalentes."),
+                delta_vs_second=round(delta_vs_second, 4),
+            )
+        return best_idx, best_er, best_win, scores, best_se, significant
 
     # ------------------------------------------------------------------
     # Public interface
@@ -817,7 +891,8 @@ class GeneticLineupOptimizer:
             # Layer 3: high-fidelity refinement
             log.info("optimizer_layer3_start", n_candidates=len(top_candidates))
             candidate_permutations = [list(ind) for ind in top_candidates]
-            best_order, best_er, best_win, ref_scores = self._refine_top_k(candidate_permutations)
+            (best_order, best_er, best_win, ref_scores,
+             best_er_se, is_significant) = self._refine_top_k(candidate_permutations)
 
             total_elapsed = time.perf_counter() - t_start
             log.info(
@@ -846,6 +921,8 @@ class GeneticLineupOptimizer:
             refinement_scores=ref_scores,
             total_elapsed_seconds=total_elapsed,
             n_fitness_evaluations=self._n_evals,
+            best_expected_runs_se=best_er_se,
+            is_significant_vs_second=is_significant,
         )
         return result
 
@@ -868,8 +945,8 @@ def optimize_lineup(
 
     Args:
         players: List of 9 ``PlayerStats`` for today's lineup.
-        lineup_probs: My team's probability matrix, shape (9, 7).
-        opp_lineup_probs: Opponent's probability matrix, shape (9, 7).
+        lineup_probs: My team's probability matrix, shape (9, 8).
+        opp_lineup_probs: Opponent's probability matrix, shape (9, 8).
         simulation_engine: Configured ``MonteCarloEngine`` instance.
         park_factor_hr: HR park factor for today's venue.
         park_factor_xb: Extra-base hit park factor.

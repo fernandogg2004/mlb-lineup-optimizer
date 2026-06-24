@@ -40,6 +40,14 @@ LEAGUE_AVG: dict[str, float] = {
 }
 
 # ---------------------------------------------------------------------------
+# Número de clases de outcome PA (fuente única de verdad)
+# ---------------------------------------------------------------------------
+# Debe coincidir con model_at_bat.PAOutcome (8 clases desde Mejora 6) y con
+# simulation_engine.N_OUTCOMES. Importar desde aquí evita contratos de shape
+# desincronizados entre el modelo, el simulador y el optimizador.
+N_OUTCOMES: int = 8
+
+# ---------------------------------------------------------------------------
 # Distribución PA de liga — 8 clases (para oponente sin datos)
 # ---------------------------------------------------------------------------
 # Orden: OUT_IN_PLAY, STRIKEOUT, WALK_HBP, SINGLE, DOUBLE, TRIPLE, HR, DP
@@ -117,3 +125,42 @@ PARK_FACTORS_BY_TEAM: dict[str, dict[str, float]] = {
     "TB":  PARK_FACTORS["395"],
     "KC":  PARK_FACTORS["31"],
 }
+
+# ---------------------------------------------------------------------------
+# Versionado de park factors por temporada (audit F13)
+# ---------------------------------------------------------------------------
+# Antes los factores eran un único dict sin fecha de vigencia. Esta estructura
+# permite mantener un conjunto por temporada y elegir el aplicable a la fecha del
+# partido, en vez de aplicar valores de un año a juegos de otro. NO se inventan
+# valores nuevos: 2025 reusa los 10 venues reales de arriba; añade un bloque por
+# año al recalibrar antes del Opening Day.
+PARK_FACTORS_META: dict[str, object] = {
+    "current_season": 2025,
+    "source": "FanGraphs Park Factors 2025",
+    "coverage": "10 venues con |desviación| > 3% vs neutro; el resto = hr/xb 1.0",
+    "note": "Actualizar anualmente: crear PARK_FACTORS_BY_SEASON[<año>] con datos del año.",
+}
+
+PARK_FACTORS_BY_SEASON: dict[int, dict[str, dict[str, float]]] = {
+    2025: PARK_FACTORS_BY_TEAM,
+}
+
+
+def get_park_factors(team_abbr: str | None, season: int | None = None) -> tuple[float, float]:
+    """Devuelve (hr, xb) del estadio del equipo local para la temporada dada.
+
+    Selecciona el conjunto de la temporada ``season`` si existe; si no, usa la
+    temporada disponible más reciente que sea ≤ ``season`` (vigencia hacia
+    adelante), o la última disponible. Equipos no listados → neutral (1.0, 1.0).
+    """
+    if not team_abbr:
+        return 1.0, 1.0
+    seasons = sorted(PARK_FACTORS_BY_SEASON.keys())
+    if season is None:
+        chosen = seasons[-1]
+    else:
+        eligible = [s for s in seasons if s <= season]
+        chosen = eligible[-1] if eligible else seasons[0]
+    table = PARK_FACTORS_BY_SEASON[chosen]
+    pf = table.get(team_abbr.upper(), {})
+    return pf.get("hr", 1.0), pf.get("xb", 1.0)

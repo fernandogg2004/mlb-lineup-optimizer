@@ -122,12 +122,17 @@ from src.constants import RUN_VALUES  # noqa: E402
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Log-scaled class weights for the 8-outcome PA model.
-# Rationale: "balanced" mode produces a 128:1 weight ratio that destabilizes
-# LightGBM (best_iteration collapses to 1). These log-scaled weights apply
-# moderate pressure on rare events (3B ~0.8%, DP ~1.5%) without causing
-# training instability. Verified empirically on 2015-2024 Silver data.
-# To disable rebalancing entirely, set class_weight=None in AtBatModelConfig.
+# ⚠️ NO USAR CON LA SIMULACIÓN (audit F17) ⚠️
+# Estos pesos de clase sesgan las probabilidades calibradas que el motor Monte
+# Carlo consume como pesos estocásticos: cualquier upweighting de clases raras
+# (3B, HR, DP) infla E[R] y rompe el gate de prior-drift de train_v3.py. El
+# training de producción FUERZA class_weight=None a propósito (ver main() y
+# train_v3.py). Esta constante se conserva solo como referencia histórica de por
+# qué NO se reescala; no la conectes a AtBatModelConfig.class_weight.
+#
+# Rationale histórico: "balanced" produce un ratio 128:1 que desestabiliza
+# LightGBM (best_iteration colapsa a 1); estos pesos log-escalados eran un
+# intento intermedio, también descartado.
 LOG_SCALED_CLASS_WEIGHTS: dict[int, float] = {
     0: 1.0,   # OUT_IN_PLAY  ~45%
     1: 1.2,   # STRIKEOUT    ~22%
@@ -862,14 +867,42 @@ class AtBatPredictor:
         # Custom unpickler: remaps __main__.ClassName → this module so pickles
         # created from a training script (where classes lived in __main__) can
         # be loaded safely inside gunicorn/uvicorn workers.
+        #
+        # Endurecimiento de seguridad (audit F12): pickle puede ejecutar código
+        # arbitrario al deserializar (reduce/__reduce__). Restringimos find_class
+        # a una allowlist de módulos de confianza (el propio modelo + el stack ML)
+        # y bloqueamos cualquier otro global. Mitiga la carga de un .pkl manipulado
+        # sin cambiar el formato del artefacto existente.
         import sys
         _this_module = sys.modules[__name__]
+
+        _ALLOWED_PREFIXES = (
+            "sklearn.", "lightgbm", "numpy", "scipy.",
+            "collections", "copyreg", "functools",
+            "src.models.model_at_bat", __name__,
+        )
+        _ALLOWED_BUILTINS = {
+            "builtins": {"list", "dict", "set", "tuple", "frozenset",
+                         "int", "float", "bool", "str", "bytes", "complex",
+                         "object", "type", "slice", "range"},
+        }
 
         class _SafeUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
                 if module == "__main__" and hasattr(_this_module, name):
                     return getattr(_this_module, name)
-                return super().find_class(module, name)
+                if module in _ALLOWED_BUILTINS:
+                    if name in _ALLOWED_BUILTINS[module]:
+                        return super().find_class(module, name)
+                    raise pickle.UnpicklingError(
+                        f"Builtin no permitido al cargar el modelo: {module}.{name}"
+                    )
+                if module == __name__ or module.startswith(_ALLOWED_PREFIXES):
+                    return super().find_class(module, name)
+                raise pickle.UnpicklingError(
+                    f"Módulo no permitido al cargar el modelo: {module}.{name}. "
+                    "Si es legítimo, añádelo a _ALLOWED_PREFIXES (audit F12)."
+                )
 
         with open(path, "rb") as f:
             payload = _SafeUnpickler(f).load()

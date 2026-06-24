@@ -39,9 +39,10 @@ DEST_PATH  = ROOT / "models" / "at_bat_predictor.pkl"
 
 # VAL_SEASON dinámico: siempre la temporada anterior al año actual.
 # Esto garantiza que el retrain anual siempre valida en el año más reciente completo
-# sin necesidad de actualización manual.
-VAL_SEASON       = _date.today().year - 1
-TRAIN_CAP_SEASON = _date.today().year   # temporada actual (parcial) incluida en train
+# sin necesidad de actualización manual. El split efectivo es train (season <
+# VAL_SEASON) < cal/eval (season == VAL_SEASON); las temporadas > VAL_SEASON
+# (año actual parcial) se EXCLUYEN aquí y entran en el retrain de producción.
+VAL_SEASON = _date.today().year - 1
 
 # Features que solo se conocen DESPUÉS de que el PA termina — usarlas en
 # training es target leakage (en serving se imputarían constantes):

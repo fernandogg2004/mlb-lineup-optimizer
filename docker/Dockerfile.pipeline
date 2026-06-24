@@ -1,0 +1,32 @@
+# =============================================================================
+# Imagen RUNNER del pipeline MLB (datos + modelo).
+# Ejecuta los scripts batch del proyecto (build_silver, build_gold_v3, train_v3,
+# predict_tonight, morning, backtest). NO sirve la API ni el frontend: esos
+# siguen ejecutándose en local y leyendo los mismos directorios del host.
+#
+# Build:   docker build -f docker/Dockerfile.pipeline -t mlb-pipeline:latest .
+# Uso:     docker run --rm -v "$PWD":/app mlb-pipeline:latest python morning.py
+# =============================================================================
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# libgomp1 -> requerido por LightGBM; build-essential/git -> wheels y pybaseball
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 build-essential git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1) Dependencias (capa cacheable)
+COPY requirements-airflow.txt .
+RUN pip install --no-cache-dir -r requirements-airflow.txt
+
+# 2) Código del proyecto. Los DATOS (data/, models/, results/, reports/) se
+#    montan como volumen en runtime, no se hornean en la imagen (ver .dockerignore).
+COPY . .
+
+# Comando por defecto: las tareas de Airflow lo sobreescriben.
+CMD ["python", "-c", "print('Imagen mlb-pipeline lista. Sobreescribe el CMD, p.ej.: python morning.py')"]

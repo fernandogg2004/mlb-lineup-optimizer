@@ -1,0 +1,102 @@
+# =============================================================================
+# Stack de automatización: Apache Airflow (LocalExecutor) + PostgreSQL.
+#
+# Airflow ORQUESTA el pipeline batch lanzando contenedores efímeros de la imagen
+# `mlb-pipeline` (DockerOperator). El frontend y la API NO viven aquí: siguen
+# ejecutándose en local y leen los directorios que el pipeline escribe en el host
+# (data/, models/, results/, reports/).
+#
+# Arranque:
+#   1) cp .env.airflow.example .env   y edita HOST_PROJECT_DIR
+#   2) docker build -f docker/Dockerfile.pipeline -t mlb-pipeline:latest .
+#   3) docker compose -f docker-compose.airflow.yml up -d
+#   4) UI en http://localhost:8080  (usuario/clave del .env)
+# =============================================================================
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.airflow
+  image: mlb-airflow:2.9.3
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.session,airflow.api.auth.backend.basic_auth'
+    # Pasados a los DAGs para construir los bind-mounts de la imagen del pipeline:
+    HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:?Define HOST_PROJECT_DIR en .env (ruta absoluta del proyecto en el host)}
+    PIPELINE_IMAGE: ${PIPELINE_IMAGE:-mlb-pipeline:latest}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    # Necesario para que DockerOperator lance contenedores hermanos del pipeline:
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --role Admin \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-airflow}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}" \
+          --email admin@example.com --firstname admin --lastname admin || true
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-db-volume:

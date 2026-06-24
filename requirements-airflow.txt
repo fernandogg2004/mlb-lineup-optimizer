@@ -1,0 +1,48 @@
+# =============================================================================
+# Dependencias de la IMAGEN DEL PIPELINE (Docker + Airflow) — uso en automático.
+# Es el subconjunto de requirements_local.txt necesario para los scripts batch
+# (ingesta, features, entrenamiento, predicción, backtest). NO incluye el
+# servidor web (fastapi/uvicorn): la API y el frontend se siguen ejecutando en
+# local, no dentro de los contenedores de automatización.
+# =============================================================================
+
+# --- ML / inferencia (pinados: el modelo se entrenó con estas versiones) ---
+numpy==1.26.4
+lightgbm==4.3.0
+numba==0.59.1
+scikit-learn==1.5.2
+scipy==1.17.1
+
+# --- Datos ---
+polars==0.20.31
+pandas>=2.2.2
+pyarrow>=15.0.2
+pybaseball==2.2.7
+
+# --- Optimizador / simulación ---
+deap==1.4.1
+ray==2.20.0
+
+# --- LLM / RAG (explicaciones tácticas) ---
+anthropic==0.103.0
+llama-index-core==0.14.22
+llama-index-llms-anthropic==0.11.4
+tiktoken==0.13.0
+
+# --- Registro de modelos (backend de filesystem local) ---
+mlflow==2.13.2
+
+# --- Validación / config / observabilidad ---
+pydantic==2.13.4
+structlog==24.1.0
+python-json-logger==2.0.7
+prometheus-client==0.25.0
+python-dotenv==1.0.1
+pyyaml==6.0.3
+
+# --- HTTP / utilidades ---
+requests>=2.32.3
+tenacity>=8.1.0,<9
+meteostat==1.6.8
+apscheduler==3.10.4
+psycopg2-binary==2.9.9

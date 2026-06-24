@@ -1,0 +1,9 @@
+# =============================================================================
+# Imagen de Airflow para la automatización del proyecto.
+# Sólo añade el provider de Docker sobre la imagen oficial: las dependencias del
+# pipeline NO se instalan aquí (corren en la imagen `mlb-pipeline` vía
+# DockerOperator), evitando conflictos de versiones con Airflow.
+# =============================================================================
+FROM apache/airflow:2.9.3-python3.11
+
+RUN pip install --no-cache-dir "apache-airflow-providers-docker==3.12.0"

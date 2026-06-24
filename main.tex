@@ -1,0 +1,333 @@
+\documentclass[10pt, letterpaper]{article}
+
+% Packages:
+\usepackage[
+    ignoreheadfoot, % set margins without considering header and footer
+    top=2 cm, % seperation between body and page edge from the top
+    bottom=2 cm, % seperation between body and page edge from the bottom
+    left=2 cm, % seperation between body and page edge from the left
+    right=2 cm, % seperation between body and page edge from the right
+    footskip=1.0 cm, % seperation between body and footer
+    % showframe % for debugging 
+]{geometry} % for adjusting page geometry
+\usepackage[explicit]{titlesec} % for customizing section titles
+\usepackage{tabularx} % for making tables with fixed width columns
+\usepackage{array} % tabularx requires this
+\usepackage[dvipsnames]{xcolor} % for coloring text
+\definecolor{primaryColor}{RGB}{0, 79, 144} % define primary color
+\usepackage{enumitem} % for customizing lists
+\usepackage{fontawesome5} % for using icons
+\usepackage{amsmath} % for math
+\usepackage[
+    pdftitle={Curriculum Fernando Gonzalez},
+    pdfauthor={Fernando Gonzalez Gonzalez},
+    pdfcreator={LaTeX with RenderCV},
+    colorlinks=true,
+    urlcolor=primaryColor
+]{hyperref} % for links, metadata and bookmarks
+\usepackage[pscoord]{eso-pic} % for floating text on the page
+\usepackage{calc} % for calculating lengths
+\usepackage{bookmark} % for bookmarks
+\usepackage{lastpage} % for getting the total number of pages
+\usepackage{changepage} % for one column entries (adjustwidth environment)
+\usepackage{paracol} % for two and three column entries
+\usepackage{ifthen} % for conditional statements
+\usepackage{needspace} % for avoiding page brake right after the section title
+\usepackage{iftex} % check if engine is pdflatex, xetex or luatex
+
+% Ensure that generate pdf is machine readable/ATS parsable:
+\ifPDFTeX
+    \input{glyphtounicode}
+    \pdfgentounicode=1
+    \usepackage[T1]{fontenc}
+    \usepackage[utf8]{inputenc}
+    \usepackage{lmodern}
+\fi
+
+\usepackage[default, type1]{sourcesanspro} 
+
+% Some settings:
+\AtBeginEnvironment{adjustwidth}{\partopsep0pt} % remove space before adjustwidth environment
+\pagestyle{empty} % no header or footer
+\setcounter{secnumdepth}{0} % no section numbering
+\setlength{\parindent}{0pt} % no indentation
+\setlength{\topskip}{0pt} % no top skip
+\setlength{\columnsep}{0.15cm} % set column seperation
+\makeatletter
+\let\ps@customFooterStyle\ps@plain % Copy the plain style to customFooterStyle
+\patchcmd{\ps@customFooterStyle}{\thepage}{
+    \color{gray}\textit{\small Fernando González González}
+}{}{} % replace number by desired string
+\makeatother
+\pagestyle{customFooterStyle}
+
+\titleformat{\section}{
+    % avoid page braking right after the section title
+    \needspace{4\baselineskip}
+    % make the font size of the section title large and color it with the primary color
+    \Large\color{primaryColor}
+}{
+}{
+}{
+    % print bold title, give 0.15 cm space and draw a line of 0.8 pt thickness
+    % from the end of the title to the end of the body
+    \textbf{#1}\hspace{0.15cm}\titlerule[0.8pt]\hspace{-0.1cm}
+}[] % section title formatting
+
+\titlespacing{\section}{
+    % left space:
+    -1pt
+}{
+    % top space:
+    0.3 cm
+}{
+    % bottom space:
+    0.2 cm
+} % section title spacing
+
+% \renewcommand\labelitemi{$\vcenter{\hbox{\small$\bullet$}}$} % custom bullet points
+\newenvironment{highlights}{
+    \begin{itemize}[
+        topsep=0.10 cm,
+        parsep=0.10 cm,
+        partopsep=0pt,
+        itemsep=0pt,
+        leftmargin=0.4 cm + 10pt
+    ]
+}{
+    \end{itemize}
+} % new environment for highlights
+
+\newenvironment{highlightsforbulletentries}{
+    \begin{itemize}[
+        topsep=0.10 cm,
+        parsep=0.10 cm,
+        partopsep=0pt,
+        itemsep=0pt,
+        leftmargin=10pt
+    ]
+}{
+    \end{itemize}
+} % new environment for highlights for bullet entries
+
+
+\newenvironment{onecolentry}{
+    \begin{adjustwidth}{
+        0.2 cm + 0.00001 cm
+    }{
+        0.2 cm + 0.00001 cm
+    }
+}{
+    \end{adjustwidth}
+} % new environment for one column entries
+
+\newenvironment{twocolentry}[2][]{
+    \onecolentry
+    \def\secondColumn{#2}
+    \setcolumnwidth{\fill, 4.5 cm}
+    \begin{paracol}{2}
+}{
+    \switchcolumn \raggedleft \secondColumn
+    \end{paracol}
+    \endonecolentry
+} % new environment for two column entries
+
+\newenvironment{threecolentry}[3][]{
+    \onecolentry
+    \def\thirdColumn{#3}
+    \setcolumnwidth{0 cm, \fill, 4.5 cm}
+    \begin{paracol}{3}
+    \noindent{\raggedright #2}\switchcolumn
+}{
+    \switchcolumn \raggedleft \thirdColumn
+    \end{paracol}
+    \endonecolentry
+} % new environment for three column entries
+
+\newenvironment{header}{
+    \setlength{\topsep}{0pt}\par\kern\topsep\centering\color{primaryColor}\linespread{1.5}
+}{
+    \par\kern\topsep
+} % new environment for the header
+
+% save the original href command in a new command:
+\let\hrefWithoutArrow\href
+
+% new command for external links:
+\renewcommand{\href}[2]{\hrefWithoutArrow{#1}{\ifthenelse{\equal{#2}{}}{ }{#2 }\raisebox{.15ex}{\footnotesize \faExternalLink*}}}
+
+
+\begin{document}
+    \newcommand{\AND}{\unskip
+        \cleaders\copy\ANDbox\hskip\wd\ANDbox
+        \ignorespaces
+    }
+    \newsavebox\ANDbox
+    \sbox\ANDbox{}
+
+    \begin{header}
+        \fontsize{30 pt}{30 pt}
+        \textbf{Fernando González González}
+
+        \vspace{0.3 cm}
+
+        \normalsize
+        \mbox{{\footnotesize\faMapMarker*}\hspace*{0.13cm}Ferrol, A Coruña}%
+        \kern 0.25 cm%
+        \AND%
+        \kern 0.25 cm%
+        \mbox{\hrefWithoutArrow{mailto:fernando.ditos@gmail.com}{{\footnotesize\faEnvelope[regular]}\hspace*{0.13cm}fernando.ditos@gmail.com}}%
+        \kern 0.25 cm%
+        \AND%
+        \kern 0.25 cm%
+        \mbox{\hrefWithoutArrow{tel:+34 671 801 801}{{\footnotesize\faPhone*}\hspace*{0.13cm}671 801 801}}%
+        \kern 0.25 cm%
+        \AND%
+        \kern 0.25 cm%
+        \mbox{\hrefWithoutArrow{https://www.linkedin.com/in/fernando-gonzalez-gonzález-7b342740b/}{{\footnotesize\faLinkedin}\hspace*{0.13cm}LinkedIn}}%
+        \kern 0.25 cm%
+        \AND%
+        \kern 0.25 cm%
+        \mbox{\hrefWithoutArrow{https://github.com/fernandogg2004}{{\footnotesize\faGithub}\hspace*{0.13cm}GitHub}}%
+        \kern 0.25 cm%
+
+    \end{header}
+
+    \vspace{0.3 cm - 0.3 cm}
+
+
+    \section{}
+
+
+
+        
+        \begin{onecolentry}
+            Data Scientist · Predictive Maintenance \& Industrial IoT | Python · XGBoost · BigQuery
+        \end{onecolentry}
+
+
+    \section{Formación}
+    
+        
+
+        \medskip
+        
+        \begin{threecolentry}{}{
+            Sep 2022 - Jun 2026
+        }
+            \textbf{Grado en Matemáticas}\\
+            \textit{Universidad de Santiago de Compostela} 
+            \begin{highlights}
+                \item \textbf{Nota media:} $8.6$.
+                \item \textbf{Logros:} 8 Matrículas de Honor (incluyendo Álgebra Lineal, Geometría, Topología y Series de Fourier).
+                \item \textbf{TFG:} "Modelos de regresión no lineales".
+            \end{highlights}
+        \end{threecolentry}
+
+        \medskip
+
+        \begin{threecolentry}{}{Sep 2020 - Jun 2021}
+            \textbf{Academic Exchange Year}\\
+            \textit{Neville High School, Luisiana, EE. UU.}
+        \end{threecolentry}
+
+
+    \medskip
+    
+    \section{Experiencia Profesional}
+
+
+        \begin{threecolentry}{}{
+            Jul 2025 - Ago 2025
+        }
+            \textbf{Data Scientist — Prácticas de Alta Intensidad} $\mid$ \textit{EcoMT}  
+            \begin{highlights}
+                \item \textbf{Desplegué en producción un sistema de detección temprana de fallos mecánicos con 97\% de F1-Score ponderado}, adelantando averías hasta 7 días y reduciendo potencialmente costes de mantenimiento no planificado sobre una flota de +1.000 activos industriales.
+                \item  \textbf{Diseñé el pipeline completo de feature engineering sobre 1,5M de registros de series temporales en BigQuery}, incorporando rolling statistics y transformadas de Fourier (FFT) sobre señales de sensor, validado con cross-validation estratificada para evitar data leakage temporal.
+                \item \textbf{Reduje un 95\% el ruido en el pipeline de datos} automatizando la detección de anomalías de sensores con Isolation Forest, eliminando entradas erróneas y ahorrando unas 2 horas de depuración manual por incidente.
+            \end{highlights}
+        \end{threecolentry}
+
+    \medskip
+
+    \section{Proyectos Destacados}
+
+        \begin{threecolentry}{}{
+            2026 - Presente
+        }
+            \textbf{MLB Lineup Optimizer — Sistema de Machine Learning End-to-End}\\
+            \textit{Proyecto Personal}
+            \begin{highlights}
+                \item \textbf{Diseñé y desplegué un sistema de ML completo (ingesta $\rightarrow$ feature store $\rightarrow$ modelo $\rightarrow$ simulación $\rightarrow$ optimización $\rightarrow$ API)} sobre +2M de turnos al bate de 12 temporadas de MLB, con feature engineering anti-leakage y validación temporal estricta.
+                \item \textbf{Entrené un modelo LightGBM multiclase calibrado (ECE de 0.002 en holdout)} cuyas probabilidades alimentan una simulación Monte Carlo (cadena de Markov base-outs, 100.000 juegos por partido) para estimar carreras esperadas y probabilidad de victoria.
+                \item \textbf{Optimicé el orden de bateo con un algoritmo genético, logrando una mejora estadísticamente significativa de $\sim$+8.5 carreras/temporada} (IC90 vía bootstrap) frente al baseline, validada con un framework de backtesting propio.
+                \item \textbf{Implementé prácticas MLOps de producción}: orquestación del pipeline con \textbf{Apache Airflow} sobre \textbf{Docker} (DAGs programados), MLflow tracking, gate de despliegue por control de drift, promoción champion/challenger y arquitectura de microservicios (FastAPI + dashboard React).
+                \item \textbf{Repo: } \url{https://github.com/fernandogg2004/mlb-lineup-optimizer}
+            \end{highlights}
+        \end{threecolentry}
+
+        \medskip
+
+        \begin{threecolentry}{}{
+            Ene 2026 - Jun 2026
+        }
+            \textbf{Modelos de Regresión No Lineales (Trabajo de Fin de Grado)}\\
+            \textit{Universidad de Santiago de Compostela}
+            \begin{highlights}
+                \item Investigación y desarrollo teórico-práctico sobre el ajuste de funciones no lineales, metodologías de inferencia sobre parámetros y validación estricta de hipótesis estadísticas.
+            \end{highlights}
+        \end{threecolentry}
+
+        \medskip
+
+        \begin{threecolentry}{}{
+        2025
+        }
+            \textbf{Modelización Estadística del Rendimiento Deportivo}\\
+            \textit{Proyecto Académico}
+            \begin{highlights}
+                \item Desarrollo íntegro de un modelo estadístico para predecir y analizar el número de goles marcados por equipos de fútbol en base a variables de rendimiento en R.
+                \item Mejora de más de un 14\% en $R^2$ respecto a baseline en un MSE de $\sim$0.5.
+                \item \textbf{Repo: } \url{https://github.com/fernandogg2004/RendimientoDeportivo}
+            \end{highlights}
+        \end{threecolentry}
+
+        \newpage
+
+        \begin{threecolentry}{}{
+        2024
+        }
+            \textbf{Modelado Analítico de Crecimiento Poblacional}\\
+            \textit{Proyecto de Investigación Teórica}
+            \begin{highlights}
+                \item  Modelado matemático avanzado en sistema de EDOs y análisis de estabilidad de la evolución de una especie biológica ante un agente contaminante externo.
+                \item \textbf{Repo: } \url{https://github.com/fernandogg2004/CrecimientoPoblacional}
+            \end{highlights}
+        \end{threecolentry}
+
+    \medskip
+   
+    \section{Habilidades}
+
+    \begin{threecolentry}{}{}
+        \textbf{Competencias Técnicas}
+        \begin{highlights}
+            \item \textbf{Lenguajes de programación}: Python, R.
+            \item \textbf{Librerías y Machine Learning:} Scikit-learn (sklearn), Pandas, NumPy, Polars, XGBoost, LightGBM.
+            \item \textbf{Visualización:} Matplotlib, Seaborn, Plotly.
+            \item \textbf{MLOps y APIs:} Docker, Apache Airflow (orquestación de pipelines), FastAPI, MLflow, simulación Monte Carlo y algoritmos genéticos, backtesting estadístico.
+            \item \textbf{Software y Herramientas Analíticas:} Consumo de APIs REST con Requests / integración con JSON/Parquet, SQL (PostgreSQL, consultas analíticas con window functions), Jupyter + VS Code en entorno local o en la nube (Vertex AI Workbench), BigQuery, Git.
+        \end{highlights}
+    \end{threecolentry}
+
+    \begin{threecolentry}{}{}
+        \textbf{Idiomas y Estancia Internacional}
+        \begin{highlights}
+            \item \textbf{Inglés:} Competencia profesional completa (Nivel C1).
+            \item \textbf{Español:} Nativo.
+        \end{highlights}
+    \end{threecolentry}
+
+
+
+\end{document}

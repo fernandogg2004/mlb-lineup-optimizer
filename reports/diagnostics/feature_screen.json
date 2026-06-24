@@ -1,0 +1,113 @@
+{
+  "generated_at": "2026-06-24T09:42:38.647444+00:00",
+  "split": {
+    "train_max": 2024,
+    "eval": 2026,
+    "train_rows": 600000
+  },
+  "results": {
+    "V0_base": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.563,
+        "STRIKEOUT": 0.5981,
+        "WALK_HBP": 0.5883,
+        "SINGLE": 0.5413,
+        "DOUBLE": 0.529,
+        "TRIPLE": 0.5887,
+        "HOME_RUN": 0.6054,
+        "DOUBLE_PLAY": 0.5583
+      },
+      "weighted_auc": 0.5701,
+      "logloss": 1.51921,
+      "best_iteration": 70,
+      "secs": 14.9
+    },
+    "V0+pitcher_xwoba_allowed_30d": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.5629,
+        "STRIKEOUT": 0.5983,
+        "WALK_HBP": 0.5902,
+        "SINGLE": 0.5425,
+        "DOUBLE": 0.527,
+        "TRIPLE": 0.5861,
+        "HOME_RUN": 0.6044,
+        "DOUBLE_PLAY": 0.555
+      },
+      "weighted_auc": 0.5703,
+      "logloss": 1.51895,
+      "best_iteration": 77,
+      "secs": 15.9,
+      "delta_wauc_vs_v0": 0.0002
+    },
+    "V0+pitcher_hard_hit_allowed_30d": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.5636,
+        "STRIKEOUT": 0.5985,
+        "WALK_HBP": 0.5907,
+        "SINGLE": 0.5425,
+        "DOUBLE": 0.5288,
+        "TRIPLE": 0.5678,
+        "HOME_RUN": 0.6064,
+        "DOUBLE_PLAY": 0.5587
+      },
+      "weighted_auc": 0.5708,
+      "logloss": 1.51874,
+      "best_iteration": 70,
+      "secs": 15.5,
+      "delta_wauc_vs_v0": 0.0007
+    },
+    "V0+batter_days_rest": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.5633,
+        "STRIKEOUT": 0.598,
+        "WALK_HBP": 0.5895,
+        "SINGLE": 0.5409,
+        "DOUBLE": 0.5313,
+        "TRIPLE": 0.5781,
+        "HOME_RUN": 0.6065,
+        "DOUBLE_PLAY": 0.5565
+      },
+      "weighted_auc": 0.5704,
+      "logloss": 1.51902,
+      "best_iteration": 75,
+      "secs": 15.6,
+      "delta_wauc_vs_v0": 0.0003
+    },
+    "V0+pitcher_days_rest": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.564,
+        "STRIKEOUT": 0.5989,
+        "WALK_HBP": 0.5907,
+        "SINGLE": 0.5424,
+        "DOUBLE": 0.5305,
+        "TRIPLE": 0.5818,
+        "HOME_RUN": 0.6076,
+        "DOUBLE_PLAY": 0.5591
+      },
+      "weighted_auc": 0.5712,
+      "logloss": 1.5186,
+      "best_iteration": 62,
+      "secs": 14.3,
+      "delta_wauc_vs_v0": 0.0011
+    },
+    "V0+all": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.5635,
+        "STRIKEOUT": 0.5987,
+        "WALK_HBP": 0.5923,
+        "SINGLE": 0.5413,
+        "DOUBLE": 0.5255,
+        "TRIPLE": 0.5751,
+        "HOME_RUN": 0.6046,
+        "DOUBLE_PLAY": 0.5599
+      },
+      "weighted_auc": 0.5707,
+      "logloss": 1.51877,
+      "best_iteration": 71,
+      "secs": 18.4,
+      "delta_wauc_vs_v0": 0.0006
+    }
+  },
+  "winners": [],
+  "verdict": "SIN GANADORAS: ninguna candidata sube el AUC ≥0.003 → la señal disponible ya está capturada; se requiere NUEVA fuente de datos (arsenal velo/spin, weather) para más discriminación."
+}

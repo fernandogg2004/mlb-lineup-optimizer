@@ -1,0 +1,97 @@
+{
+  "generated_at": "2026-06-24T08:58:26.402907+00:00",
+  "oos_season": 2026,
+  "model_path": "models\\at_bat_predictor.pkl",
+  "pa_level_oos": {
+    "n_pa": 82574,
+    "overall_logloss": 1.51992,
+    "overall_ece": 0.0021,
+    "ece_target_met": true,
+    "expected_run_value_pred": 0.16817,
+    "expected_run_value_obs": 0.16881,
+    "expected_run_value_bias": -0.00064,
+    "per_class_logloss": {
+      "OUT_IN_PLAY": 0.68056,
+      "STRIKEOUT": 0.51624,
+      "WALK_HBP": 0.32834,
+      "SINGLE": 0.40445,
+      "DOUBLE": 0.17361,
+      "TRIPLE": 0.02353,
+      "HOME_RUN": 0.13076,
+      "DOUBLE_PLAY": 0.09683
+    },
+    "per_class_ece": {
+      "OUT_IN_PLAY": 0.00401,
+      "STRIKEOUT": 0.00407,
+      "WALK_HBP": 0.00378,
+      "SINGLE": 0.00366,
+      "DOUBLE": 0.00034,
+      "TRIPLE": 6e-05,
+      "HOME_RUN": 0.00039,
+      "DOUBLE_PLAY": 0.00051
+    },
+    "per_class_auc": {
+      "OUT_IN_PLAY": 0.5635,
+      "STRIKEOUT": 0.5995,
+      "WALK_HBP": 0.59,
+      "SINGLE": 0.5426,
+      "DOUBLE": 0.5251,
+      "TRIPLE": 0.5893,
+      "HOME_RUN": 0.6066,
+      "DOUBLE_PLAY": 0.5572
+    },
+    "per_class_support": {
+      "OUT_IN_PLAY": 36469,
+      "STRIKEOUT": 18160,
+      "WALK_HBP": 8550,
+      "SINGLE": 11594,
+      "DOUBLE": 3453,
+      "TRIPLE": 292,
+      "HOME_RUN": 2432,
+      "DOUBLE_PLAY": 1624
+    },
+    "weighted_auc": 0.5709,
+    "predicted_outcome_distribution": {
+      "OUT_IN_PLAY": 0.442,
+      "STRIKEOUT": 0.2201,
+      "WALK_HBP": 0.1,
+      "SINGLE": 0.1436,
+      "DOUBLE": 0.0415,
+      "TRIPLE": 0.0036,
+      "HOME_RUN": 0.0291,
+      "DOUBLE_PLAY": 0.0202
+    },
+    "observed_outcome_distribution": {
+      "OUT_IN_PLAY": 0.4417,
+      "STRIKEOUT": 0.2199,
+      "WALK_HBP": 0.1035,
+      "SINGLE": 0.1404,
+      "DOUBLE": 0.0418,
+      "TRIPLE": 0.0035,
+      "HOME_RUN": 0.0295,
+      "DOUBLE_PLAY": 0.0197
+    }
+  },
+  "winprob_dispersion": {
+    "n_predictions": 212,
+    "n_files_scanned": 444,
+    "mean": 0.4999,
+    "std": 0.1026,
+    "min": 0.192,
+    "p05": 0.3418,
+    "p25": 0.4325,
+    "p50": 0.507,
+    "p75": 0.5672,
+    "p95": 0.657,
+    "max": 0.802,
+    "frac_in_0.45_0.55": 0.3302,
+    "frac_in_0.40_0.60": 0.7123
+  },
+  "verdict": {
+    "pa_calibrated_oos": true,
+    "pa_discriminates_oos": false,
+    "winprob_collapsed": false,
+    "error_locus": "PA model",
+    "message": "El PA model discrimina poco OOS (AUC bajo). El cuello de botella está en el modelo de plate appearance. Prioriza Fase 1."
+  }
+}

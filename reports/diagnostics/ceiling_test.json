@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-06-24T09:10:12.965256+00:00",
+  "split": {
+    "train_max_season": 2024,
+    "earlystop_season": 2025,
+    "eval_season": 2026,
+    "train_rows": 600000
+  },
+  "variants": {
+    "V0_actual": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.563,
+        "STRIKEOUT": 0.5981,
+        "WALK_HBP": 0.5883,
+        "SINGLE": 0.5413,
+        "DOUBLE": 0.529,
+        "TRIPLE": 0.5887,
+        "HOME_RUN": 0.6054,
+        "DOUBLE_PLAY": 0.5583
+      },
+      "weighted_auc": 0.5701,
+      "logloss": 1.51921,
+      "best_iteration": 70,
+      "train_seconds": 16.1
+    },
+    "V1_identidad": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.5565,
+        "STRIKEOUT": 0.5923,
+        "WALK_HBP": 0.5778,
+        "SINGLE": 0.5314,
+        "DOUBLE": 0.503,
+        "TRIPLE": 0.5517,
+        "HOME_RUN": 0.582,
+        "DOUBLE_PLAY": 0.5427
+      },
+      "weighted_auc": 0.5613,
+      "logloss": 1.52521,
+      "best_iteration": 22,
+      "train_seconds": 17.3
+    },
+    "V2_contacto": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.9369,
+        "STRIKEOUT": 0.9994,
+        "WALK_HBP": 0.9993,
+        "SINGLE": 0.9272,
+        "DOUBLE": 0.8938,
+        "TRIPLE": 0.8929,
+        "HOME_RUN": 0.9894,
+        "DOUBLE_PLAY": 0.8582
+      },
+      "weighted_auc": 0.9538,
+      "logloss": 0.4768,
+      "best_iteration": 154,
+      "train_seconds": 27.8
+    },
+    "V3_oraculo": {
+      "per_class_auc": {
+        "OUT_IN_PLAY": 0.9334,
+        "STRIKEOUT": 0.9994,
+        "WALK_HBP": 0.9993,
+        "SINGLE": 0.923,
+        "DOUBLE": 0.8869,
+        "TRIPLE": 0.8754,
+        "HOME_RUN": 0.9883,
+        "DOUBLE_PLAY": 0.8477
+      },
+      "weighted_auc": 0.951,
+      "logloss": 0.49518,
+      "best_iteration": 89,
+      "train_seconds": 28.8
+    }
+  },
+  "headroom_v3_minus_v0": 0.3809,
+  "identity_gain_v1_minus_v0": -0.0088,
+  "verdict": "MARGEN: el techo supera claramente al control -> Fase 1 (mejores features pre-PA) tiene recorrido."
+}

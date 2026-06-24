@@ -204,6 +204,26 @@ def _load_silver() -> pl.DataFrame:
     return pl.concat(parts, how="diagonal_relaxed").sort(["batter_id", "game_date"])
 
 
+def _resolve_batter_stand(rows: pl.DataFrame, pitcher_throws: str) -> str:
+    """Devuelve la mano EFECTIVA del bateador para la lógica de platoon.
+
+    Audit F05: antes se hardcodeaba "R" para todos, anulando el ajuste de
+    platoon del SabermetricSeeder. Aquí se usa la mano real del Silver:
+      - Switch hitter (≥2 stands en el historial): batea del lado opuesto al
+        lanzador → "L" vs RHP, "R" vs LHP (ventaja de platoon).
+      - Bateador fijo: su mano modal ("L"/"R").
+      - Sin historial: "R" por defecto.
+    """
+    if rows is None or rows.is_empty() or "batter_stand" not in rows.columns:
+        return "R"
+    stands = set(rows["batter_stand"].drop_nulls().unique().to_list())
+    if len(stands) >= 2:
+        return "L" if pitcher_throws == "R" else "R"
+    if stands:
+        return rows["batter_stand"].drop_nulls().mode()[0]
+    return "R"
+
+
 def compute_features(
     batter_id: int,
     pitcher_throws: str,
@@ -376,6 +396,62 @@ def _run_game_simulation(
 
 
 # ---------------------------------------------------------------------------
+# Optimización real del orden de bateo (audit F01)
+# ---------------------------------------------------------------------------
+
+def _optimize_order(
+    players9: list,
+    pitcher_hand: str,
+    park_factor_hr: float = 1.0,
+    park_factor_xb: float = 1.0,
+    n_sims: int = 6_000,
+    fast_sims: int = 2_000,
+    objective: str = "expected_runs",
+) -> tuple[list[int], float, bool]:
+    """Busca el orden de bateo óptimo con el GA (audit F01).
+
+    Antes producción solo usaba SabermetricSeeder.canonical_seed() (una heurística
+    que evalúa UN orden). Esta función conecta el GeneticLineupOptimizer ya
+    corregido (8 clases, fitness probabilístico con park factors) para BUSCAR
+    realmente sobre las permutaciones y devolver el mejor orden contra un
+    oponente de liga promedio (el rival es constante entre órdenes, así que sirve
+    para ordenar nuestra alineación).
+
+    Args:
+        players9: lista de 9 ``PlayerStats`` con ``prob_vector`` (9,8).
+        pitcher_hand: mano del abridor rival ("R"/"L") para el seeding de platoon.
+        park_factor_hr / park_factor_xb: factores del estadio.
+        n_sims / fast_sims: simulaciones de refinamiento / fitness (reducidas para
+            latencia de game-day; subir para más precisión).
+
+    Returns:
+        ``(best_order_indices, best_expected_runs, is_significant_vs_second)``.
+    """
+    from src.simulation.simulation_engine import MonteCarloConfig, MonteCarloEngine
+    from src.optimizer.lineup_optimizer import (
+        GAConfig, GeneticLineupOptimizer,
+    )
+
+    lineup_probs = np.array([p.prob_vector for p in players9], dtype=np.float32)
+    opp = _LEAGUE_AVG_LINEUP.astype(np.float32)
+    engine = MonteCarloEngine(MonteCarloConfig(
+        use_ray=False, n_simulations=n_sims, fast_mode_n_sims=fast_sims,
+        use_extra_innings=False,
+    ))
+    cfg = GAConfig(
+        n_generations=40, population_size=80, n_sabermetric_seeds=20,
+        refinement_top_k=6,
+        objective=objective,   # audit A2: "expected_runs" (default) | "win_probability"
+    )
+    optimizer = GeneticLineupOptimizer(players9, lineup_probs, engine, opp, config=cfg)
+    res = optimizer.run(
+        pitcher_hand=pitcher_hand,
+        park_factor_hr=park_factor_hr, park_factor_xb=park_factor_xb,
+    )
+    return res.best_lineup_indices, res.best_expected_runs, res.is_significant_vs_second
+
+
+# ---------------------------------------------------------------------------
 # Helpers reutilizables
 # ---------------------------------------------------------------------------
 
@@ -415,6 +491,7 @@ def _predict_one_side(
     game_date: str,
     verbose: bool = True,
     feature_names: list[str] | None = None,
+    optimize: bool = False,
 ) -> dict | None:
     """Calcula el orden optimo para un equipo en un partido.
 
@@ -474,12 +551,19 @@ def _predict_one_side(
             woba_s = _LEAGUE_AVG["woba"]
         if not np.isfinite(iso_s):
             iso_s = _LEAGUE_AVG["iso"]
-        obp_e  = min(woba_s / 0.87 + 0.04, 0.450) if woba_s > 0.01 else 0.330
-        in_hist = silver.filter(pl.col("batter_id") == pid).height > 0
+        # OBP real = P(llegar a base) del prob_vector calibrado (audit F09):
+        # índices 2..6 = BB/HBP, 1B, 2B, 3B, HR (excluye OUT, K, DP). Sustituye
+        # la estimación colineal woba/0.87+0.04 que colapsaba el orden a "por wOBA".
+        obp_e  = float(pv[2] + pv[3] + pv[4] + pv[5] + pv[6])
+        # Filas del jugador (una vez): historial + mano real para el seeder (F05)
+        prows   = silver.filter(pl.col("batter_id") == pid)
+        in_hist = prows.height > 0
+        stand   = _resolve_batter_stand(prows, opp_pitcher_throws)
 
         # Detectar bateadores con datos insuficientes (rookies o muy poca historia)
         pa_30d = float(X[fcols.index("pa_30d")]) if "pa_30d" in fcols else 0.0
-        if not in_hist or not np.isfinite(pa_30d) or pa_30d < 30:
+        low_data = (not in_hist) or (not np.isfinite(pa_30d)) or (pa_30d < 30)
+        if low_data:
             low_data_batters.append(name)
 
         if verbose:
@@ -493,7 +577,10 @@ def _predict_one_side(
             "woba": woba_s if woba_s > 0.01 else _LEAGUE_AVG["woba"],
             "obp":  obp_e,
             "iso":  iso_s  if iso_s  > 0.001 else _LEAGUE_AVG["iso"],
+            "stand": stand,
             "in_hist": in_hist,
+            "low_data": low_data,
+            "pa_30d": pa_30d if np.isfinite(pa_30d) else 0.0,
         })
 
     if verbose:
@@ -503,11 +590,44 @@ def _predict_one_side(
         PlayerStats(
             player_id=r["id"], player_name=r["name"],
             obp=r["obp"], woba=r["woba"], iso=r["iso"],
-            batter_stand="R", prob_vector=r["prob_vector"],
+            batter_stand=r["stand"], prob_vector=r["prob_vector"],
         )
         for r in results[:9]
     ]
-    order_idx = SabermetricSeeder(players9).canonical_seed(pitcher_hand=opp_pitcher_throws)
+    seeder_idx = SabermetricSeeder(players9).canonical_seed(pitcher_hand=opp_pitcher_throws)
+
+    # Optimización real opcional (audit F01): si optimize=True, el GA BUSCA el
+    # mejor orden en vez de usar solo la heurística del seeder.
+    optimization_mode = "SabermetricSeeder"
+    ga_significant = None
+    if optimize:
+        try:
+            # Anti doble-conteo de park factors (audit B1): si el modelo ya
+            # incluye park_factor_* como features, los prob_vectors YA están
+            # ajustados al estadio; el GA debe simular en modo NEUTRO, igual que
+            # la simulación MC final (model_has_park => pf=1.0). Aplicar los
+            # factores aquí los contaría dos veces e inflaría el E[R] del GA,
+            # descalibrando el paisaje de búsqueda respecto al refinamiento.
+            # Solo modelos legacy (sin park features) usan los factores reales.
+            _fcols = feature_names if feature_names is not None else FEATURE_COLS
+            _model_has_park = "park_factor_hr" in (_fcols or [])
+            ga_pf_hr, ga_pf_xb = (1.0, 1.0) if _model_has_park else (pf_hr, pf_xb)
+            ga_idx, ga_er, ga_significant = _optimize_order(
+                players9, opp_pitcher_throws,
+                park_factor_hr=ga_pf_hr, park_factor_xb=ga_pf_xb,
+            )
+            order_idx = ga_idx
+            optimization_mode = "GeneticOptimizer"
+            if verbose:
+                print(f"  Optimizador GA: E[R]={ga_er:.3f}  "
+                      f"{'(significativo vs #2)' if ga_significant else '(no significativo vs #2)'}")
+        except Exception as exc:
+            if verbose:
+                print(f"  [WARN] GA falló ({exc}); usando SabermetricSeeder.")
+            order_idx = seeder_idx
+    else:
+        order_idx = seeder_idx
+
     ordered   = [{"name": players9[i].player_name, "prob_vector": players9[i].prob_vector,
                   "woba": players9[i].woba, "obp": players9[i].obp}
                  for i in order_idx]
@@ -531,6 +651,8 @@ def _predict_one_side(
         "side":        side,
         "opp_pitcher": opp_pitcher,
         "opp_pitcher_throws": opp_pitcher_throws,
+        "optimization_mode": optimization_mode,          # audit F01
+        "order_significant_vs_second": ga_significant,    # None si modo seeder
         "roster_used": [r["name"] for r in results],
         "batting_order": [
             {
@@ -549,6 +671,12 @@ def _predict_one_side(
                                    if len(players9[i].prob_vector) > 7 else 0.0, 4),
                 "woba_stab": round(players9[i].woba, 4),
                 "obp_est":   round(players9[i].obp, 4),
+                # Confianza por bateador (audit F14): el dashboard puede marcar
+                # en la propia fila a quién se le aplicó media de liga por falta
+                # de datos, en vez de solo en un resumen agregado.
+                "low_data":   bool(results[i].get("low_data", False)),
+                "pa_30d":     round(float(results[i].get("pa_30d", 0.0)), 1),
+                "confidence": "low" if results[i].get("low_data", False) else "high",
             }
             for s, i in enumerate(order_idx)
         ],
@@ -601,6 +729,9 @@ def main() -> None:
                         help="Omitir simulacion Monte Carlo (mas rapido, E[R] menos preciso)")
     parser.add_argument("--n-sims",  type=int, default=10_000, dest="n_sims",
                         help="Simulaciones Monte Carlo por partido (default: 10000)")
+    parser.add_argument("--optimize", action="store_true", dest="optimize",
+                        help="Busca el orden óptimo con el GA (audit F01) en vez de "
+                             "solo la heurística SabermetricSeeder. Más lento (3-30s).")
     args = parser.parse_args()
 
     game_date = args.date
@@ -651,7 +782,7 @@ def main() -> None:
                 print(f"\n  [{side.upper()}] {team['name']}")
                 result = _predict_one_side(
                     game, side, silver, predictor, game_date,
-                    verbose=True, feature_names=feature_names,
+                    verbose=True, feature_names=feature_names, optimize=args.optimize,
                 )
                 if result is None:
                     print("  Roster insuficiente — omitido.")
@@ -677,6 +808,12 @@ def main() -> None:
                                                 n_sims=args.n_sims)
                 side_results["away"].update(sim_away)
                 side_results["home"].update(sim_home)
+                # Marca de validez: win_probability proviene de una simulación de
+                # DOS LADOS consistente (P(home)+P(away)≈1). Higiene de datos —
+                # evita que el ~52% de predicciones a medio simular que contaminó
+                # el backtest histórico se cuele sin etiquetar.
+                side_results["away"]["sim_status"] = "two_sided"
+                side_results["home"]["sim_status"] = "two_sided"
 
                 print(f"  {away_name}: E[R]={sim_away['expected_runs_per_game']}  "
                       f"P(W)={sim_away['win_probability']:.1%}  "
@@ -694,10 +831,14 @@ def main() -> None:
                                            park_factor_xb=pf_xb,
                                            n_sims=args.n_sims)
                 side_results[side].update(sim)
+                # win_probability es vs un rival de liga promedio (no el real):
+                # NO comparable a nivel juego — el backtest debe excluirlo.
+                side_results[side]["sim_status"] = "vs_league_avg"
             else:
                 # --no-sim or no results: remove internal field if present
                 for r in side_results.values():
                     r.pop("_lineup_probs_matrix", None)
+                    r["sim_status"] = "no_sim"
 
             # Save results to disk
             for side, result in side_results.items():
@@ -762,7 +903,8 @@ def main() -> None:
     print(f"  Partido: {away_name} @ {home_name}  (pk={pk})")
 
     result = _predict_one_side(game, args.side, silver, predictor, game_date,
-                               verbose=True, feature_names=feature_names)
+                               verbose=True, feature_names=feature_names,
+                               optimize=args.optimize)
     if result is None:
         print("  No se pudo procesar: roster insuficiente.")
         return

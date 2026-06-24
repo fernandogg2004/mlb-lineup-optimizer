@@ -24,10 +24,11 @@ backtest y diagnóstico.
 4. [Instalación](#instalación)
 5. [Flujo de datos y entrenamiento](#flujo-de-datos-y-entrenamiento)
 6. [Uso](#uso)
-7. [Evaluación y diagnóstico](#evaluación-y-diagnóstico)
-8. [Contratos e invariantes](#contratos-e-invariantes)
-9. [Tests](#tests)
-10. [Limitaciones](#limitaciones)
+7. [Automatización (Docker + Apache Airflow)](#automatización-docker--apache-airflow)
+8. [Evaluación y diagnóstico](#evaluación-y-diagnóstico)
+9. [Contratos e invariantes](#contratos-e-invariantes)
+10. [Tests](#tests)
+11. [Limitaciones](#limitaciones)
 
 ---
 
@@ -97,6 +98,10 @@ con test de significancia del ganador vs el segundo.
 ├── build_silver.py           # ingesta Statcast → capa Silver (PA-level)
 ├── train_v3.py               # entrenamiento del modelo (Gold → modelo + gate)
 ├── backtest.py               # backtest out-of-sample a nivel juego (IC bootstrap)
+├── docker/                   # Dockerfile.pipeline (runner batch) + Dockerfile.airflow
+├── docker-compose.airflow.yml  # stack de automatización (Airflow + Postgres)
+├── dags/                     # DAGs de Airflow (pipeline semanal + predicciones diarias)
+├── requirements-airflow.txt  # deps de la imagen del pipeline (sin servidor web)
 ├── scripts/
 │   ├── build_gold_v3.py      # Silver → Gold (features de entrenamiento)
 │   ├── promote_model.py      # promoción champion/challenger
@@ -243,6 +248,80 @@ Operación: `GET /health`, `GET /metrics` (Prometheus).
 
 Servicio FastAPI separado, orientado a integración programática:
 `POST /v1/predict/at-bat`, `POST /v1/optimize/lineup` (async), `GET /health`, `GET /metrics`.
+
+---
+
+## Automatización (Docker + Apache Airflow)
+
+El proyecto incluye scaffolding **opcional** para ejecutar el pipeline de datos/modelo
+de forma automática y programada. **No es necesario para el uso normal** (todo funciona en
+local), pero está presente por si alguien quiere operarlo desatendido.
+
+> **El frontend NO cambia.** La automatización sólo orquesta el pipeline *batch*. Airflow
+> escribe en `data/`, `models/`, `results/` y `reports/` del host (vía volúmenes), y tu
+> frontend + `api/main.py` siguen ejecutándose **en local** leyendo esos mismos directorios.
+
+### Diseño
+
+```
+┌─────────────── Docker ───────────────┐         Host (local)
+│  Apache Airflow (LocalExecutor)       │   ┌────────────────────────┐
+│  scheduler + webserver + PostgreSQL   │   │  data/  models/        │
+│            │ DockerOperator           │   │  results/  reports/    │ ◄─┐
+│            ▼                          │   └────────────────────────┘   │ escribe
+│  Contenedor efímero `mlb-pipeline`    │──────────► (volúmenes montados) ┘
+│  (ejecuta build_silver / build_gold / │
+│   train_v3 / morning / backtest)      │   ┌────────────────────────┐
+└───────────────────────────────────────┘   │  frontend + api/main.py│ ◄── leen los
+                                             │  (se ejecutan EN LOCAL)│     mismos dirs
+                                             └────────────────────────┘
+```
+
+Airflow no lleva las dependencias del proyecto: lanza la imagen `mlb-pipeline` por cada
+tarea (`DockerOperator`), evitando conflictos de versiones.
+
+### Puesta en marcha
+
+Requisitos: **Docker** y **Docker Compose** (Docker Desktop en Windows/Mac).
+
+```bash
+# 1. Configurar el entorno: copia la plantilla y edita HOST_PROJECT_DIR (ruta ABSOLUTA del proyecto)
+cp .env.airflow.example .env
+#   HOST_PROJECT_DIR=/ruta/absoluta/al/proyecto   (Windows: C:\Users\ferna\Desktop\MLB AI)
+
+# 2. Construir la imagen del pipeline (contiene el código + deps batch)
+docker build -f docker/Dockerfile.pipeline -t mlb-pipeline:latest .
+
+# 3. Levantar el stack de Airflow (construye su imagen, inicia Postgres + scheduler + webserver)
+docker compose -f docker-compose.airflow.yml up -d
+
+# 4. Abrir la UI en http://localhost:8080  (usuario/clave del .env, por defecto airflow/airflow)
+#    Activar (unpause) los DAGs deseados.
+
+# Parar / limpiar:
+docker compose -f docker-compose.airflow.yml down            # parar
+docker compose -f docker-compose.airflow.yml down -v         # parar y borrar la BBDD de Airflow
+```
+
+### DAGs incluidos (`dags/`)
+
+| DAG | Schedule (por defecto) | Qué hace |
+|---|---|---|
+| `mlb_data_pipeline` | semanal (lun 08:00) | `build_silver` → `build_gold_v3` → `train_v3` (con gate) → `backtest` |
+| `mlb_daily_predictions` | diario (13:00 UTC) | `morning.py` (post-game + schedule + predicciones del día) |
+
+Si el **gate de despliegue** del entrenamiento falla, `train_v3.py` termina con código ≠0 y la
+tarea `train_model` se marca como fallida: el modelo **no** se promociona a producción.
+
+### Notas
+
+- **Sin conflictos de dependencias**: el pipeline corre en su propia imagen; Airflow sólo añade
+  `apache-airflow-providers-docker`.
+- **DockerOperator** necesita el socket de Docker (`/var/run/docker.sock`), ya montado en el
+  compose. En Docker Desktop (Windows/Mac) funciona sin pasos extra.
+- Ajusta los `schedule` de los DAGs a tu zona horaria / calendario MLB.
+- Ejecutar un paso suelto sin Airflow (la misma imagen):
+  `docker run --rm -v "$PWD":/app mlb-pipeline:latest python morning.py`
 
 ---
 
